@@ -250,8 +250,6 @@ that I understand and have the ability to maintain.
 - Replace plain TCP syslog with authenticated TLS or RELP.
 - Benchmark `pasta` against `slirp4netns` and pin the faster one.
 - Confirm `live-restore` behaves under rootless, and re-add it if so.
-- Proxmox first-boot integration tests for all profiles and the APPDATA
-  failure modes.
 
 ## License
 
