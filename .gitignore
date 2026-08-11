@@ -1,0 +1,6 @@
+build/
+tools/.env
+*.pub
+__pycache__/
+.env
+id_ed25519*

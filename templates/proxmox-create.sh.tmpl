@@ -1,0 +1,222 @@
+#!/bin/bash
+# Generated locally for one template. Copy/paste or run it on Proxmox.
+set -Eeuo pipefail
+
+VMID=@@VMID@@
+NAME=@@NAME@@
+CPU=@@CPU@@
+MEM_MIN=@@MEM_MIN@@
+MEM_MAX=@@MEM_MAX@@
+BRIDGE=@@BRIDGE@@
+VM_STORAGE_NAME=@@VM_STORAGE_NAME@@
+SNIPPET_STORAGE_NAME=@@SNIPPET_STORAGE_NAME@@
+ISO_STORAGE_PATH=@@ISO_STORAGE_PATH@@
+ROOT_DISK_SIZE=@@ROOT_DISK_SIZE@@
+APPDATA_DISK_SIZE=@@APPDATA_DISK_SIZE@@
+APPDATA_SERIAL=@@APPDATA_SERIAL@@
+APPDATA_WWN=@@APPDATA_WWN@@
+
+VENDOR_SNIPPET_NAME=@@VENDOR_SNIPPET_NAME@@
+VENDOR_SHA256=@@VENDOR_SHA256@@
+
+SSH_PUBLIC_KEY=@@SSH_PUBLIC_KEY@@
+
+IMAGE_NAME=@@IMAGE_NAME@@
+IMAGE_SHA512=@@IMAGE_SHA512@@
+IMAGE_URL=@@IMAGE_URL@@
+
+replace=0
+
+usage() {
+  cat >&2 <<USAGE
+Usage: ${0##*/} [--replace]
+
+  --replace   Destroy the existing template at VMID $VMID before rebuilding.
+              Template names carry no version, so this is how you roll a new
+              build. Proxmox refuses to destroy a template that still has
+              linked clones; remove them first, or use full clones.
+USAGE
+  exit 2
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --replace) replace=1; shift ;;
+    -h|--help) usage ;;
+    *) echo "ERROR: unknown argument: $1" >&2; usage ;;
+  esac
+done
+
+fail() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || fail "Required command is missing: $1"
+}
+
+[ "$(id -u)" -eq 0 ] || fail "Run these commands as root on Proxmox"
+for command in awk curl mktemp mv pvesm qm sha256sum sha512sum ssh-keygen; do
+  require_command "$command"
+done
+
+[ -d "$ISO_STORAGE_PATH" ] || \
+  fail "Proxmox ISO directory is missing: $ISO_STORAGE_PATH"
+
+# The storage is the only authority for where snippets live. Resolving the
+# volume here means the file verified below is the file qm create reads.
+vendor_volume="${SNIPPET_STORAGE_NAME}:snippets/${VENDOR_SNIPPET_NAME}"
+pvesm status --storage "$SNIPPET_STORAGE_NAME" >/dev/null 2>&1 || \
+  fail "Proxmox storage is missing or inactive: $SNIPPET_STORAGE_NAME"
+vendor_path="$(pvesm path "$vendor_volume")" || \
+  fail "Could not resolve $vendor_volume; does $SNIPPET_STORAGE_NAME allow snippets?"
+case "$vendor_path" in
+  /*) ;;
+  *) fail "pvesm returned an unexpected path for $vendor_volume: $vendor_path" ;;
+esac
+
+[ -r "$vendor_path" ] || fail "Vendor snippet is missing: $vendor_path"
+printf '%s  %s\n' "$VENDOR_SHA256" "$vendor_path" | sha256sum --check -
+
+if command -v cloud-init >/dev/null 2>&1; then
+  cloud-init schema --config-file "$vendor_path"
+fi
+
+# Resolve what is already at this VMID before changing anything.
+if qm config "$VMID" >/dev/null 2>&1; then
+  if [ "$replace" -ne 1 ]; then
+    fail "VMID $VMID already exists; pass --replace to rebuild it"
+  fi
+
+  existing_name="$(qm config "$VMID" | awk -F': ' '/^name: / { print $2; exit }')"
+  if [ "$existing_name" != "$NAME" ]; then
+    fail "VMID $VMID holds '$existing_name', not '$NAME'; refusing to replace it"
+  fi
+  if [ "$(qm config "$VMID" | awk -F': ' '/^template: / { print $2; exit }')" != 1 ]; then
+    fail "VMID $VMID is a live VM, not a template; refusing to replace it"
+  fi
+
+  echo "Replacing existing template $VMID ($existing_name)"
+  if ! destroy_output="$(qm destroy "$VMID" --purge 1 2>&1)"; then
+    printf '%s\n' "$destroy_output" >&2
+    case "$destroy_output" in
+      *[Ll]inked*|*[Bb]ase*volume*)
+        fail "Template $VMID still has linked clones. Remove them, or convert
+       them to full clones, before rebuilding this template."
+        ;;
+    esac
+    fail "Could not destroy the existing template $VMID"
+  fi
+fi
+
+image_path="${ISO_STORAGE_PATH}/${IMAGE_NAME}"
+image_temp=""
+ssh_key_file=""
+vm_created=0
+current_vmid=""
+cleanup() {
+  local original_exit_code="$?"
+  trap - EXIT
+  [ -z "$image_temp" ] || rm -f -- "$image_temp"
+  [ -z "$ssh_key_file" ] || rm -f -- "$ssh_key_file"
+  if [ "$original_exit_code" -ne 0 ] && \
+    [ "$vm_created" -eq 1 ] && [ -n "$current_vmid" ]; then
+    echo "Removing VM $current_vmid created by the failed invocation" >&2
+    qm destroy "$current_vmid" --purge 1 >/dev/null 2>&1 || \
+      echo "WARNING: could not remove partial VM $current_vmid" >&2
+  fi
+  exit "$original_exit_code"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if [ ! -e "$image_path" ]; then
+  image_temp="$(mktemp --tmpdir="$ISO_STORAGE_PATH" ".${IMAGE_NAME}.XXXXXX")"
+  curl --fail --location --proto '=https' --tlsv1.2 --retry 5 \
+    --output "$image_temp" "$IMAGE_URL"
+  printf '%s  %s\n' "$IMAGE_SHA512" "$image_temp" | sha512sum --check -
+  chmod 0644 "$image_temp"
+  mv --no-clobber -- "$image_temp" "$image_path"
+  [ -e "$image_temp" ] || image_temp=""
+fi
+printf '%s  %s\n' "$IMAGE_SHA512" "$image_path" | sha512sum --check -
+
+# Proxmox reads the key from a file and folds it into the user-data it
+# generates, which is also the only place it emits the hostname.
+ssh_key_file="$(mktemp)"
+chmod 0600 "$ssh_key_file"
+printf '%s\n' "$SSH_PUBLIC_KEY" > "$ssh_key_file"
+ssh-keygen -l -f "$ssh_key_file" >/dev/null
+
+create_template() {
+  local vmid="$1"
+  local name="$2"
+  local root_volume
+
+  current_vmid="$vmid"
+  vm_created=1
+  qm create "$vmid" \
+    --name "$name" \
+    --cores "$CPU" \
+    --cpu host \
+    --memory "$MEM_MAX" \
+    --balloon "$MEM_MIN" \
+    --net0 "virtio,bridge=${BRIDGE},queues=${CPU},firewall=1" \
+    --scsihw virtio-scsi-single \
+    --serial0 socket \
+    --vga serial0 \
+    --cicustom "vendor=${vendor_volume}" \
+    --ciuser admin \
+    --sshkeys "$ssh_key_file" \
+    --ciupgrade 0 \
+    --agent 1 \
+    --ostype l26 \
+    --localtime 0 \
+    --tablet 0
+  qm set "$vmid" --rng0 source=/dev/urandom,max_bytes=1024,period=1000
+  qm set "$vmid" --ipconfig0 ip=dhcp
+
+  qm importdisk "$vmid" "$image_path" "$VM_STORAGE_NAME"
+  root_volume="$(
+    qm config "$vmid" |
+      awk -F': ' '/^unused[0-9]+: / && !found { print $2; found=1 }'
+  )"
+  [ -n "$root_volume" ] || fail "Could not identify the imported root volume"
+  qm set "$vmid" \
+    --scsi0 "${root_volume},ssd=1,discard=on,iothread=1"
+
+  # ROOT_DISK_SIZE is in GiB, matching the APPDATA_DISK_SIZE convention above.
+  qm resize "$vmid" scsi0 "${ROOT_DISK_SIZE}G"
+
+  qm set "$vmid" \
+    --scsi1 "${VM_STORAGE_NAME}:${APPDATA_DISK_SIZE},ssd=1,discard=on,iothread=1,backup=1,serial=${APPDATA_SERIAL},wwn=${APPDATA_WWN}"
+
+  qm set "$vmid" \
+    --ide2 "${VM_STORAGE_NAME}:cloudinit" \
+    --boot order=scsi0
+
+  # The cloud-init drive exists now, so confirm Proxmox really generated the
+  # user-data this template depends on before freezing it.
+  local generated_user_data
+  generated_user_data="$(qm cloudinit dump "$vmid" user)"
+
+  grep -Fxq "hostname: $name" <<<"$generated_user_data" || \
+    fail "Generated user-data is missing hostname: $name"
+
+  grep -Fxq "user: admin" <<<"$generated_user_data" || \
+    fail "Generated user-data is missing user: admin"
+
+  grep -q '^ssh_authorized_keys:' <<<"$generated_user_data" || \
+    fail "Generated user-data is missing SSH authorized keys"
+
+  qm template "$vmid"
+  vm_created=0
+  current_vmid=""
+}
+
+create_template "$VMID" "$NAME"
+
+echo "Created Proxmox template $VMID ($NAME) successfully"
+echo "Boot it once to complete cloud-init; the VM remains running afterward."

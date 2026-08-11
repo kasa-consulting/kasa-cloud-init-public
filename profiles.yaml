@@ -1,0 +1,33 @@
+# Profile manifest. Each entry is one Proxmox template.
+#
+# Profiles are enumerated explicitly rather than derived as a cross-product of
+# flags, so adding a feature does not double the number of templates built.
+#
+# vmid_offset is added to VMID_START from tools/.env. Offsets must be unique.
+# Template names carry no version: a rebuild replaces the existing template.
+# Provenance lives in /etc/kasa-image-release inside the guest instead.
+
+profiles:
+  - name: agent-base
+    description: Hardened Debian agent host
+    vmid_offset: 0
+    flags:
+      - remote_syslog
+
+  - name: agent-docker
+    description: Hardened Debian agent host with rootless Docker
+    vmid_offset: 1
+    flags:
+      - docker
+      - remote_syslog
+
+  - name: agent-base-local
+    description: Hardened Debian agent host with durable local logging
+    vmid_offset: 2
+    flags: []
+
+  - name: agent-docker-local
+    description: Hardened Debian agent host with rootless Docker and durable local logging
+    vmid_offset: 3
+    flags:
+      - docker
