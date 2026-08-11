@@ -127,7 +127,7 @@ write_files:
 
   # Do not add a user namespace restriction here (user.max_user_namespaces=0 or
   # kernel.apparmor_restrict_unprivileged_userns=1). Debian 13 leaves
-  # unprivileged user namespaces open, and the agent-docker profile's rootless
+  # unprivileged user namespaces open, and the docker profile's rootless
   # daemon depends on them. Restricting them breaks Docker on this image.
   - path: /etc/sysctl.d/20-hardening.conf
     owner: root:root

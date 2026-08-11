@@ -8,25 +8,25 @@
 # Provenance lives in /etc/kasa-image-release inside the guest instead.
 
 profiles:
-  - name: agent-base
+  - name: base
     description: Hardened Debian agent host
     vmid_offset: 0
     flags:
       - remote_syslog
 
-  - name: agent-docker
+  - name: docker
     description: Hardened Debian agent host with rootless Docker
     vmid_offset: 1
     flags:
       - docker
       - remote_syslog
 
-  - name: agent-base-local
+  - name: base-local
     description: Hardened Debian agent host with durable local logging
     vmid_offset: 2
     flags: []
 
-  - name: agent-docker-local
+  - name: docker-local
     description: Hardened Debian agent host with rootless Docker and durable local logging
     vmid_offset: 3
     flags:

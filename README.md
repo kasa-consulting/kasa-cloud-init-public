@@ -120,7 +120,7 @@ a rebuild replaces the existing template (see [Rebuilding](#rebuilding)).
 Provenance lives inside the guest instead, in `/etc/kasa-image-release`:
 
 ```
-ID=agent-docker
+ID=docker
 DESCRIPTION=Hardened Debian agent host with rootless Docker
 RELEASE=deb13
 DEBIAN_IMAGE_BUILD=20260722-2547
