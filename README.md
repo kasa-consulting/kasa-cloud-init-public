@@ -217,7 +217,7 @@ profiles, a clone never writes routine logs to its disk. `/var/log` is a tmpfs
 mounted from `local-fs.target` before cloud-init runs, the journal is volatile,
 the rsyslog queue has no disk spool, and fail2ban logs to the journal with its
 ban database in `/run`. The only swap device is zram, so nothing pages to disk
-either.
+either.  This is great if you're trying to reduce disk writes, but does come with downsides.
 
 What you give up:
 
@@ -226,11 +226,6 @@ What you give up:
 - **A sustained log storm is rate-limited** to 25,000 messages per 60 seconds.
 - **Reboots lose all local history.**
 - **fail2ban forgets its bans on reboot.** They survive a fail2ban restart.
-
-Two things can stay on disk on purpose: `/home/admin/logs/`, written only to
-debug a failed first boot; and whatever the template build boot wrote to
-`/var/log` before the tmpfs was enabled, which is shadowed and unused on every
-clone.
 
 Because the collector matters this much, the first-boot self-test probes it. On
 the template build boot an unreachable collector is a warning, so the template
