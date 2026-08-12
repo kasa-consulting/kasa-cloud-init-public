@@ -1,0 +1,57 @@
+name: Feature request
+description: Suggest an improvement or new capability for KASA Cloud Init
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement. Explain the problem first so we can evaluate the best solution.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What problem are you trying to solve, and who does it affect?
+      placeholder: Describe the current limitation or unmet need.
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior or capability you would like.
+      placeholder: Explain how the feature should work.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe any workarounds or other approaches you considered.
+
+  - type: textarea
+    id: examples
+    attributes:
+      label: Example configuration or workflow
+      description: Show how the feature might be configured or used.
+      render: yaml
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add links, screenshots, related issues, or implementation ideas.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-submission checklist
+      options:
+        - label: I searched existing issues and did not find a duplicate request.
+          required: true
+        - label: This request describes one focused feature or improvement.
+          required: true
