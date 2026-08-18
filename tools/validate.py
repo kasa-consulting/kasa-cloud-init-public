@@ -48,6 +48,19 @@ TEST_SSH_PUBLIC_KEY = (
     "bundle-validation@example.invalid"
 )
 
+SSH_ALLOW_USERS = (
+    "admin@10.1.10.100",
+    "admin@10.1.10.101",
+    "admin@10.1.75.2",
+    "admin@10.1.2.19",
+    "admin@10.1.11.105",
+)
+
+STRICT_RP_FILTER_KEYS = (
+    "net.ipv4.conf.all.rp_filter",
+    "net.ipv4.conf.default.rp_filter",
+)
+
 # Paths that must appear only in the docker profile.
 DOCKER_ONLY_PATHS = (
     "/etc/apt/sources.list.d/docker.sources",
@@ -63,12 +76,28 @@ APPDATA_PATHS = (
     "/etc/systemd/system/appdata-verify.service",
 )
 
-RAM_LOGGING_PATHS = (
+REMOTE_SYSLOG_PATHS = (
     "/etc/systemd/journald.conf.d/60-remote-syslog.conf",
-    "/etc/systemd/system/var-log.mount",
-    "/etc/tmpfiles.d/60-ram-logging.conf",
     "/etc/rsyslog.d/01-remote.conf",
     "/etc/fail2ban/fail2ban.local",
+)
+
+# Cloud-init fills a short or None-holding mounts row from mount_default_fields,
+# at every index. cc_mounts.sanitize_mounts_configuration() substitutes
+# default_fields[index] for each None token and appends default_fields for each
+# missing trailing field, so fs_spec and fs_file inherit exactly like the rest.
+# The upstream default vfstype is "auto", so a row can mount a tmpfs without the
+# word tmpfs appearing in the row itself.
+CLOUD_INIT_MOUNT_DEFAULT_FIELDS = (None, None, "auto", "defaults,nofail", "0", "2")
+
+# A tmpfs on /var/log hides every directory a package created at install time,
+# which breaks nginx, Apache, Supervisor and friends across reboot. A persistent
+# filesystem mounted there is fine and must keep validating, so these match the
+# backing store rather than the name of any unit or mountpoint.
+VAR_LOG_TMPFS_COMMANDS = (
+    re.compile(r"\bmount\b.*-t[ \t]+tmpfs.*/var/log"),
+    re.compile(r"\bmount\b.*/var/log.*-t[ \t]+tmpfs"),
+    re.compile(r"\bsystemd-mount\b.*--tmpfs.*/var/log"),
 )
 
 REQUIRED_RSYSLOG_FRAGMENTS = (
@@ -86,8 +115,9 @@ REQUIRED_RSYSLOG_FRAGMENTS = (
     'queue.discardSeverity="7"',
 )
 
-# Naming a spool file is what makes an rsyslog queue disk-assisted. RAM-only
-# logging is a stated property of this image, so these are build failures.
+# Naming a spool file is what makes an rsyslog queue disk-assisted. A
+# memory-only forwarding queue is a stated property of the remote-syslog
+# profiles, so these are build failures.
 FORBIDDEN_RSYSLOG_FRAGMENTS = (
     "queue.filename",
     "queue.maxDiskSpace",
@@ -139,6 +169,49 @@ def strip_comments(text: str) -> str:
     return "\n".join(
         line for line in text.splitlines() if not line.strip().startswith("#")
     )
+
+
+def validate_ssh_source_restriction(profile: Profile, document: dict) -> None:
+    """Require the exact additive AllowUsers policy on every profile."""
+    name = profile.name
+    sshd = files_by_path(document).get(
+        "/etc/ssh/sshd_config.d/99-harden.conf", {}
+    ).get("content", "")
+    entries: list[str] = []
+    for line in strip_comments(sshd).splitlines():
+        fields = line.split()
+        if fields and fields[0].lower() == "allowusers":
+            # OpenSSH appends every AllowUsers occurrence, so validate the
+            # combined effective list rather than only one physical line.
+            entries.extend(fields[1:])
+
+    if len(entries) != len(SSH_ALLOW_USERS) or set(entries) != set(SSH_ALLOW_USERS):
+        report(
+            name,
+            "AllowUsers must contain exactly: " + " ".join(SSH_ALLOW_USERS),
+        )
+
+
+def validate_strict_rp_filter(profile: Profile, document: dict) -> None:
+    """Require one strict reverse-path-filter assignment for each governed key."""
+    name = profile.name
+    hardening = files_by_path(document).get(
+        "/etc/sysctl.d/20-hardening.conf", {}
+    ).get("content", "")
+    active = strip_comments(hardening)
+
+    for key in STRICT_RP_FILTER_KEYS:
+        values = re.findall(
+            rf"^\s*{re.escape(key)}\s*=\s*(\S+)\s*$",
+            active,
+            re.MULTILINE,
+        )
+        if values != ["1"]:
+            report(
+                name,
+                f"{key} must have exactly one active strict-mode assignment (= 1); "
+                f"found {values}",
+            )
 
 
 def validate_common(profile: Profile, document: dict, rendered: str) -> None:
@@ -207,6 +280,7 @@ def validate_common(profile: Profile, document: dict, rendered: str) -> None:
         "PasswordAuthentication no",
         "PermitRootLogin no",
         "AuthenticationMethods publickey",
+        "KbdInteractiveAuthentication no",
         "MaxAuthTries 3",
     ):
         if directive not in sshd:
@@ -353,19 +427,106 @@ def validate_rsyslog(profile: Profile, document: dict) -> None:
             report(name, f"rsyslog TLS is not configured here: found {fragment}")
 
 
-def validate_ram_logging(profile: Profile, document: dict) -> None:
+def _mount_unit_is_var_log_tmpfs(content: str) -> bool:
+    """Does this systemd mount unit put a tmpfs on /var/log?
+
+    Type= is optional in a mount unit — systemd can determine the filesystem
+    automatically — so What=tmpfs alone is still the prohibited configuration.
+    """
+    body = strip_comments(content)
+    directives = {
+        line.strip().replace(" ", "") for line in body.splitlines() if "=" in line
+    }
+    if "Where=/var/log" not in directives:
+        return False
+    return "Type=tmpfs" in directives or "What=tmpfs" in directives
+
+
+def _mounts_row_is_var_log_tmpfs(row: object, defaults: list) -> bool:
+    """Does this cloud-init mounts row resolve to a tmpfs on /var/log?
+
+    Every one of the three fields inherits from mount_default_fields, fs_spec and
+    fs_file included. Verified against cloud-init 25.1.4, the version Debian 13
+    ships and the pinned image carries: sanitize_mounts_configuration() replaces
+    each None token with default_fields[index] and appends default_fields for
+    every missing trailing field, both without exempting index 0 or 1.
+
+    The upstream schema says a declaration with only fs_spec and no fs_file is
+    skipped, which is true only while mount_default_fields[1] is None — its stock
+    value. remove_nonexistent_devices() tests line[1] after the default has
+    already been substituted, so a configuration naming a mountpoint there makes
+    ["tmpfs"] a real mount. Resolving only fs_vfstype from the defaults would let
+    that configuration validate while the shipped runtime still mounts the tmpfs.
+    """
+    if not isinstance(row, (list, tuple)):
+        return False
+    resolved = []
+    for index in range(3):
+        value = row[index] if index < len(row) else None
+        if value is None:
+            value = defaults[index] if index < len(defaults) else None
+        resolved.append(str(value) if value is not None else "")
+    fs_spec, fs_file, fs_vfstype = resolved
+    if fs_file.rstrip("/") != "/var/log":
+        return False
+    return "tmpfs" in (fs_spec, fs_vfstype)
+
+
+def validate_var_log_persistence(profile: Profile, document: dict) -> None:
+    """Reject a tmpfs-backed /var/log on every profile.
+
+    The invariant is the backing store, not the name of a unit or mountpoint: a
+    persistent filesystem mounted at /var/log satisfies the durability contract
+    and must keep validating.
+    """
+    name = profile.name
+
+    for entry in document.get("write_files", []):
+        if _mount_unit_is_var_log_tmpfs(entry.get("content", "")):
+            report(
+                name,
+                f"{entry['path']}: mounts a tmpfs on /var/log, which hides "
+                "package-created log directories across reboot",
+            )
+
+    defaults = document.get("mount_default_fields")
+    if not isinstance(defaults, (list, tuple)):
+        defaults = CLOUD_INIT_MOUNT_DEFAULT_FIELDS
+    for row in document.get("mounts", []) or []:
+        if _mounts_row_is_var_log_tmpfs(row, list(defaults)):
+            report(name, f"mounts row puts a tmpfs on /var/log: {row}")
+
+    commands = [document.get("bootcmd", []), document.get("runcmd", [])]
+    texts = [
+        entry.get("content", "") for entry in document.get("write_files", [])
+    ]
+    for command in commands:
+        for item in command or []:
+            texts.append(item if isinstance(item, str) else " ".join(map(str, item)))
+    for text in texts:
+        for line in strip_comments(text).splitlines():
+            if any(pattern.search(line) for pattern in VAR_LOG_TMPFS_COMMANDS):
+                report(name, f"command mounts a tmpfs on /var/log: {line.strip()}")
+
+
+def validate_remote_syslog(profile: Profile, document: dict) -> None:
+    """Check the profile-level remote-logging contract.
+
+    Its three enforceable properties are a volatile journal, a forwarding queue
+    with no disk spool, and fail2ban ban state under /run. /var/log persistence
+    is profile-agnostic and belongs to validate_var_log_persistence.
+    """
     name = profile.name
     files = files_by_path(document)
 
     if not profile.remote_syslog:
-        for path in RAM_LOGGING_PATHS:
+        for path in REMOTE_SYSLOG_PATHS:
             if path in files:
                 report(name, f"local logging profile must not include {path}")
         finalize = files.get("/usr/local/sbin/cloud-init-finalize", {}).get(
             "content", ""
         )
         for forbidden in (
-            "systemctl enable var-log.mount",
             "systemctl restart systemd-journald.service",
             "/run/rsyslog/imjournal.state",
             "remote syslog forwarding smoke test",
@@ -378,9 +539,9 @@ def validate_ram_logging(profile: Profile, document: dict) -> None:
                 )
         return
 
-    for path in RAM_LOGGING_PATHS:
+    for path in REMOTE_SYSLOG_PATHS:
         if path not in files:
-            report(name, f"RAM-only logging is missing {path}")
+            report(name, f"remote logging is missing {path}")
 
     journald = files.get(
         "/etc/systemd/journald.conf.d/60-remote-syslog.conf", {}
@@ -390,25 +551,22 @@ def validate_ram_logging(profile: Profile, document: dict) -> None:
     if "ForwardToSyslog=no" not in journald:
         report(name, "journald must not forward to syslog; rsyslog reads the journal")
 
-    var_log = files.get("/etc/systemd/system/var-log.mount", {}).get("content", "")
-    if "Type=tmpfs" not in var_log or "Where=/var/log" not in var_log:
-        report(name, "var-log.mount must be a tmpfs on /var/log")
-    if "ConditionPathExists=/etc/kasa-template-built" not in var_log:
-        report(
-            name,
-            "var-log.mount must be gated by /etc/kasa-template-built",
-        )
-    if "WantedBy=local-fs.target" not in var_log:
-        report(name, "var-log.mount must be wanted by local-fs.target")
-
-    finalize = files.get("/usr/local/sbin/cloud-init-finalize", {}).get("content", "")
-    # Starting it during the build boot would hide the log cloud-init is
-    # currently writing, which is the only way to debug a failed build.
-    for forbidden in ("systemctl start var-log.mount", "enable --now var-log.mount"):
-        if forbidden in finalize:
-            report(name, f"var-log.mount must be enabled but not started: {forbidden}")
-    if "systemctl enable var-log.mount" not in finalize:
-        report(name, "finalize must enable var-log.mount")
+    # fail2ban writes its own log file and ban database under /var by default.
+    # Both must stay off disk for the memory-only guarantee to mean anything.
+    fail2ban = strip_comments(
+        files.get("/etc/fail2ban/fail2ban.local", {}).get("content", "")
+    )
+    # Anchored so a commented-out directive cannot satisfy the check, and
+    # case-insensitive because fail2ban compares target.upper() in its own
+    # setLogTarget, making logtarget=systemd-journal the same configuration.
+    if not re.search(
+        r"^\s*logtarget\s*=\s*SYSTEMD-JOURNAL\s*$",
+        fail2ban,
+        re.MULTILINE | re.IGNORECASE,
+    ):
+        report(name, "fail2ban must log to the journal, not to a file")
+    if not re.search(r"^\s*dbfile\s*=\s*/run/", fail2ban, re.MULTILINE):
+        report(name, "fail2ban ban database must be volatile, under /run")
 
     for entry in document.get("write_files", []):
         body = strip_comments(entry.get("content", ""))
@@ -416,7 +574,8 @@ def validate_ram_logging(profile: Profile, document: dict) -> None:
             if forbidden in body:
                 report(
                     name,
-                    f"{entry['path']}: {forbidden} defeats RAM-only logging",
+                    f"{entry['path']}: {forbidden} makes system logging durable "
+                    "on disk",
                 )
 
 
@@ -819,9 +978,12 @@ def main() -> int:
             continue
 
         validate_common(profile, document, content)
+        validate_ssh_source_restriction(profile, document)
+        validate_strict_rp_filter(profile, document)
         validate_image_release(profile, document)
+        validate_var_log_persistence(profile, document)
         validate_rsyslog(profile, document)
-        validate_ram_logging(profile, document)
+        validate_remote_syslog(profile, document)
         validate_appdata(profile, document)
         validate_docker_rootless(profile, document)
         validate_no_secrets(profile, content)

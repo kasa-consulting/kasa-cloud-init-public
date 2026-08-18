@@ -114,6 +114,7 @@ write_files:
     content: |
       PasswordAuthentication no
       PermitRootLogin no
+      AllowUsers admin@10.1.10.100 admin@10.1.10.101 admin@10.1.75.2 admin@10.1.2.19 admin@10.1.11.105
       AuthenticationMethods publickey
       KbdInteractiveAuthentication no
       PermitUserEnvironment no
@@ -142,8 +143,8 @@ write_files:
       net.ipv4.conf.all.send_redirects = 0
       net.ipv4.conf.default.send_redirects = 0
       net.ipv4.conf.*.send_redirects = 0
-      net.ipv4.conf.all.rp_filter = 2
-      net.ipv4.conf.default.rp_filter = 2
+      net.ipv4.conf.all.rp_filter = 1
+      net.ipv4.conf.default.rp_filter = 1
       net.ipv4.tcp_syncookies = 1
       net.ipv6.conf.all.accept_redirects = 0
       net.ipv6.conf.default.accept_redirects = 0
@@ -207,8 +208,11 @@ write_files:
       swap-priority = 150
 
 #% if remote_syslog
-  # --- RAM-only remote logging ------------------------------------------
-  # The collector is the only durable copy of this VM's logs.
+  # --- Volatile journal + remote forwarding -----------------------------
+  # The collector is the only durable copy of the journal and syslog stream.
+  # /var/log itself stays persistent, so packages that create a log directory
+  # at install time keep it across reboot; anything writing files there
+  # directly, including cloud-init's own logs, is durable on disk.
 
   - path: /etc/systemd/journald.conf.d/60-remote-syslog.conf
     owner: root:root
@@ -220,40 +224,6 @@ write_files:
       ForwardToSyslog=no
       RateLimitIntervalSec=30s
       RateLimitBurst=5000
-
-  # /var/log is a tmpfs so it catches every writer the settings below do not
-  # name individually, including any package added later. The finalizer enables
-  # the unit and creates /etc/kasa-template-built, whose condition prevents
-  # RequiresMountsFor=/var/log consumers from starting the mount during the
-  # build boot. Clones mount it from local-fs.target before cloud-init runs.
-  - path: /etc/systemd/system/var-log.mount
-    owner: root:root
-    permissions: "0644"
-    content: |
-      [Unit]
-      Description=Volatile /var/log (tmpfs)
-      ConditionPathExists=/etc/kasa-template-built
-
-      [Mount]
-      What=tmpfs
-      Where=/var/log
-      Type=tmpfs
-      Options=mode=0755,nosuid,nodev,noexec,size=128M
-
-      [Install]
-      WantedBy=local-fs.target
-
-  # systemd's own var.conf and systemd.conf already recreate /var/log and
-  # /var/log/private on the empty tmpfs. Nothing recreates /var/log/journal,
-  # which is what keeps the journal in /run/log/journal.
-  - path: /etc/tmpfiles.d/60-ram-logging.conf
-    owner: root:root
-    permissions: "0644"
-    content: |
-      d /var/log/apt 0755 root root -
-      d /var/log/unattended-upgrades 0755 root root -
-      f /var/log/wtmp 0664 root utmp -
-      f /var/log/btmp 0660 root utmp -
 
   # imjournal needs /run/rsyslog to exist before rsyslog starts, and rsyslog is
   # socket-activated through syslog.socket, so start ordering cannot be assumed.
@@ -270,8 +240,9 @@ write_files:
       RuntimeDirectoryPreserve=yes
 
   # fail2ban logs to a file and keeps its ban database under /var by default.
-  # SYSTEMD-JOURNAL also gets its output forwarded to the collector, which the
-  # tmpfs alone would not do. Bans do not survive a reboot.
+  # SYSTEMD-JOURNAL gets its output forwarded to the collector instead, and the
+  # database moves to /run so no ban state is written to disk. Bans do not
+  # survive a reboot.
   - path: /etc/fail2ban/fail2ban.local
     owner: root:root
     permissions: "0644"
@@ -910,14 +881,10 @@ write_files:
 #% endif
 
 #% if remote_syslog
-      # --- RAM-only remote logging ---
+      # --- Volatile journal + remote forwarding ---
       sed -i -E \
         's/^[[:space:]]*module\(load="imuxsock".*$/# disabled: using imjournal/; s/^[[:space:]]*module\(load="imklog".*$/# disabled: using imjournal/' \
         /etc/rsyslog.conf
-      systemd-analyze verify /etc/systemd/system/var-log.mount
-      systemctl enable var-log.mount
-      systemctl is-enabled --quiet var-log.mount
-
       systemctl restart systemd-journald.service
 #% endif
       /usr/sbin/rsyslogd -N1
@@ -930,9 +897,10 @@ write_files:
       [ -e /run/rsyslog/imjournal.state ]
       logger -t cloud-init "remote syslog forwarding smoke test"
 
-      # The collector is the only durable log. On the build boot an unreachable
-      # collector is a warning, because the template must still be buildable
-      # without one; on a clone it is fatal, because the VM would run blind.
+      # The collector is the only durable copy of the journal and syslog stream.
+      # On the build boot an unreachable collector is a warning, because the
+      # template must still be buildable without one; on a clone it is fatal,
+      # because the VM would run blind.
       if ! timeout 5 bash -c \
         "</dev/tcp/@@SYSLOG_SERVER@@/@@SYSLOG_PORT@@" 2>/dev/null; then
         if [ -f /etc/kasa-template-built ]; then
