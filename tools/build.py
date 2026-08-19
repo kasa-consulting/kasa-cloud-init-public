@@ -23,7 +23,9 @@ from render import (
     DEFAULT_RELEASE,
     LOCAL_CONFIG,
     PROFILES,
+    PRIVATE_SOURCE_MARKER,
     ROOT,
+    SSH_ALLOW_USERS,
     Image,
     Profile,
     load_image,
@@ -287,6 +289,8 @@ def vendor_artifacts(release: str, provenance: dict[str, str]) -> tuple[VendorAr
 def build(release: str) -> None:
     if "KASA_ENV_FILE" not in os.environ and not LOCAL_CONFIG.is_file():
         fail("copy tools/env.example to tools/.env and edit it first")
+    if PRIVATE_SOURCE_MARKER.is_file() and not SSH_ALLOW_USERS:
+        fail("private source builds require SSH_ALLOW_USERS in tools/.env")
     for command in ("bash", "ssh-keygen"):
         if not shutil.which(command):
             fail(f"required local command is missing: {command}")

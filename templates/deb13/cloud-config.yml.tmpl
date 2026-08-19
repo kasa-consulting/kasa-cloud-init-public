@@ -114,7 +114,7 @@ write_files:
     content: |
       PasswordAuthentication no
       PermitRootLogin no
-      AllowUsers admin@10.1.10.100 admin@10.1.10.101 admin@10.1.75.2 admin@10.1.2.19 admin@10.1.11.105
+      @@SSH_ALLOW_USERS_DIRECTIVE@@
       AuthenticationMethods publickey
       KbdInteractiveAuthentication no
       PermitUserEnvironment no

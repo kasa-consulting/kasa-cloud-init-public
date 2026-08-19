@@ -29,6 +29,7 @@ from render import (
     PROFILES,
     ROOT,
     SITE,
+    SSH_ALLOW_USERS,
     Profile,
     load_image,
     render,
@@ -46,14 +47,6 @@ TEST_SSH_PUBLIC_KEY = (
     "ssh-ed25519 "
     "AAAAC3NzaC1lZDI1NTE5AAAAIB4YrFhM2yPVzO+3kI14mYw3V91sCi1qdtB2bWjBv7E4 "
     "bundle-validation@example.invalid"
-)
-
-SSH_ALLOW_USERS = (
-    "admin@10.1.10.100",
-    "admin@10.1.10.101",
-    "admin@10.1.75.2",
-    "admin@10.1.2.19",
-    "admin@10.1.11.105",
 )
 
 STRICT_RP_FILTER_KEYS = (
@@ -188,7 +181,8 @@ def validate_ssh_source_restriction(profile: Profile, document: dict) -> None:
     if len(entries) != len(SSH_ALLOW_USERS) or set(entries) != set(SSH_ALLOW_USERS):
         report(
             name,
-            "AllowUsers must contain exactly: " + " ".join(SSH_ALLOW_USERS),
+            "AllowUsers must match the private policy exactly: "
+            + (" ".join(SSH_ALLOW_USERS) or "no active entries"),
         )
 
 

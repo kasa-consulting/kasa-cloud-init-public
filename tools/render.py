@@ -19,6 +19,7 @@ DOCKER_KEY = ROOT / "assets" / "docker-release.asc"
 PROFILE_MANIFEST = ROOT / "profiles.yaml"
 LOCAL_CONFIG = ROOT / "tools" / ".env"
 EXAMPLE_CONFIG = ROOT / "tools" / "env.example"
+PRIVATE_SOURCE_MARKER = ROOT / ".kasa-private-source"
 
 DEFAULT_RELEASE = "deb13"
 
@@ -33,6 +34,7 @@ SITE_KEYS = {
     "TIMEZONE",
     "APPDATA_WWN",
     "APPDATA_SERIAL",
+    "SSH_ALLOW_USERS",
 }
 BUILD_KEYS = {
     "VMID_START",
@@ -95,12 +97,14 @@ def _config_path() -> Path:
 CONFIG_FILE = _config_path()
 
 
-def _parse_config_value(raw_value: str, line_number: int) -> str:
+def _parse_config_value(
+    raw_value: str, line_number: int, *, allow_empty: bool = False
+) -> str:
     try:
         values = shlex.split(raw_value, comments=False, posix=True)
     except ValueError as error:
         raise ValueError(f"{CONFIG_FILE}:{line_number}: {error}") from error
-    if len(values) != 1 or not values[0]:
+    if len(values) != 1 or (not values[0] and not allow_empty):
         raise ValueError(
             f"{CONFIG_FILE}:{line_number}: values containing spaces must be quoted"
         )
@@ -236,7 +240,9 @@ def load_config(profiles: tuple[Profile, ...]) -> dict[str, str]:
             raise ValueError(f"{CONFIG_FILE}:{line_number}: unknown key {key}")
         if key in values:
             raise ValueError(f"{CONFIG_FILE}:{line_number}: duplicate key {key}")
-        values[key] = _parse_config_value(raw_value, line_number)
+        values[key] = _parse_config_value(
+            raw_value, line_number, allow_empty=key == "SSH_ALLOW_USERS"
+        )
 
     missing = sorted(CONFIG_KEYS - values.keys())
     if missing:
@@ -274,6 +280,26 @@ def load_config(profiles: tuple[Profile, ...]) -> dict[str, str]:
         raise ValueError(
             f"{CONFIG_FILE}: FAIL2BAN_IGNORE_IPS must include IPv4 and IPv6 loopback"
         )
+
+    ssh_allow_users = values["SSH_ALLOW_USERS"].split()
+    if len(ssh_allow_users) != len(set(ssh_allow_users)):
+        raise ValueError(f"{CONFIG_FILE}: SSH_ALLOW_USERS must not contain duplicates")
+    for entry in ssh_allow_users:
+        match = re.fullmatch(r"admin@(.+)", entry)
+        if not match:
+            raise ValueError(
+                f"{CONFIG_FILE}: SSH_ALLOW_USERS entries must be exact admin@IP addresses"
+            )
+        try:
+            address = ipaddress.ip_address(match.group(1))
+        except ValueError as error:
+            raise ValueError(
+                f"{CONFIG_FILE}: SSH_ALLOW_USERS entry is not an exact IP address: {entry}"
+            ) from error
+        if address.version != 4:
+            raise ValueError(
+                f"{CONFIG_FILE}: SSH_ALLOW_USERS currently supports IPv4 only: {entry}"
+            )
 
     # A bad timezone only surfaces at first boot, where it is expensive to see.
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9+_-]*(?:/[A-Za-z0-9+_-]+){0,2}", values["TIMEZONE"]):
@@ -327,6 +353,7 @@ except ValueError as error:
     raise SystemExit(f"ERROR: {error}") from None
 
 SITE = {key: CONFIG[key] for key in SITE_KEYS}
+SSH_ALLOW_USERS = tuple(CONFIG["SSH_ALLOW_USERS"].split())
 
 
 def render(profile: Profile, release: str = DEFAULT_RELEASE, **extra: str) -> str:
@@ -350,6 +377,11 @@ def render(profile: Profile, release: str = DEFAULT_RELEASE, **extra: str) -> st
         "@@TIMEZONE@@": SITE["TIMEZONE"],
         "@@APPDATA_WWN@@": SITE["APPDATA_WWN"],
         "@@APPDATA_SERIAL@@": SITE["APPDATA_SERIAL"],
+        "@@SSH_ALLOW_USERS_DIRECTIVE@@": (
+            "AllowUsers " + " ".join(SSH_ALLOW_USERS)
+            if SSH_ALLOW_USERS
+            else "# AllowUsers source restriction is not configured"
+        ),
     }
     replacements.update({f"@@{key}@@": value for key, value in extra.items()})
 

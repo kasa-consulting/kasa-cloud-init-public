@@ -15,7 +15,7 @@ volume in the Proxmox GUI, reboot the VM, and the partition grows automatically.
 | `kasa-deb13-base` | No | Yes | No; durable local logs |
 | `kasa-deb13-docker` | Yes | Yes | No; durable local logs |
 
-Two things to understand before you use these, both deliberate:
+Things to understand before you use these, both deliberate:
 
 > **Remote-syslog profiles keep system logging in memory.**
 > For the templates ending in `-syslog`, the journal is volatile, the rsyslog
@@ -32,6 +32,18 @@ Two things to understand before you use these, both deliberate:
 > `kernel.apparmor_restrict_unprivileged_userns` restriction to the hardening
 > sysctls; it would break Docker on this image. Keep in mind that rootless
 > Docker cannot publish ports below 1024.
+
+> The published template has no active `AllowUsers` directive. Public-key-only
+> authentication, disabled root login, `MaxAuthTries 3`, and
+> `LoginGraceTime 30s` remain enforced. To restrict sources, set
+> `SSH_ALLOW_USERS` in `tools/.env` to exact `admin@IP` entries for your
+> environment. For example, `admin@10.10.10.100 admin@192.168.1.100`. The
+> published default is empty; example addresses are never active authorization.
+
+> `rp_filter` settings use Linux strict mode (`1`), change to `2` if you have multiple
+> NIC's in the VM
+
+> Rootless docker cannot expose ports below 1024
 
 ## How to use
 
@@ -50,7 +62,8 @@ $EDITOR tools/.env
 
 Set at least `SYSLOG_SERVER`, `SYSLOG_PORT`, `FAIL2BAN_IGNORE_IPS`, `BRIDGE`,
 `VMID_START`, and `SSH_PUBLIC_KEY_FILE`. `VMID_START` must begin a range of
-unused VM IDs — one per profile in `profiles.yaml`.
+unused VM IDs — one per profile in `profiles.yaml`. If you configure SSH source
+authorization, use exact `admin@IP` entries in `SSH_ALLOW_USERS`.
 
 ```bash
 ./tools/validate.sh          # structure and content checks
@@ -90,34 +103,30 @@ regenerated.
 
 ## Rebuilding
 
-Template names carry no version, so a rebuild replaces:
-
-```bash
-bash create-kasa-deb13-docker.sh --replace
-```
-
-Without `--replace` the script refuses when the VM ID is in use. With it, the
-script checks the ID really holds a template with the expected name, then
-destroys it.
-
 **Proxmox will not destroy a template that still has linked clones.** If your
 agent VMs are linked clones, remove them or convert them to full clones before
 rebuilding. The script reports this case explicitly rather than half-completing.
 
 ## How the repository is organised
 
-Two axes, kept separate:
+| Path | Purpose |
+| --- | --- |
+| `tools/.env` | Your local settings, copied from `tools/env.example`. Gitignored. **Create this first.** |
+| `profiles.yaml` | Which templates get built, and their flags. |
+| `templates/deb13/` | The cloud-config template and the Debian image pin. |
+| `templates/proxmox-create.sh.tmpl` | The `qm create` script emitted per template. |
+| `tools/build.sh` | Build command. The only thing that writes artifacts. |
+| `tools/validate.sh` | Validate without building. |
+| `build/` | Generated output. Gitignored, rebuilt from scratch every time. |
 
-- **Features** are build-time flags. `templates/deb13/cloud-config.yml.tmpl` is
-  one file with `docker` and `remote_syslog` conditionals, and `profiles.yaml`
-  enumerates the templates that get built. Adding a feature is one flag plus one manifest
-  entry; it does not double the number of templates, because profiles are listed
-  explicitly rather than derived as a cross-product of every flag.
-- **Debian releases** are directories. `templates/deb13/` holds the cloud-config
+- `templates/deb13/cloud-config.yml.tmpl` is
+  one file with `docker` and `remote_syslog` conditionals
+  `profiles.yaml` enumerates the templates that get built.
+- `templates/deb13/` holds the cloud-config
   and an `image.yaml` pinning that release's cloud image build and SHA512.
-  Debian 14 becomes `templates/deb14/`; pass `--release deb14`.
 
-There is deliberately **no template versioning**. Template names are stable and
+
+There is deliberately no template versioning. Template names are stable and
 a rebuild replaces the existing template (see [Rebuilding](#rebuilding)).
 Provenance lives inside the guest instead, in `/etc/kasa-image-release`:
 
@@ -130,16 +139,6 @@ SOURCE_COMMIT=1f3c0c1e...
 SOURCE_TREE_DIRTY=false
 BUILT_AT=2026-08-05T20:14:03+00:00
 ```
-
-| Path | Purpose |
-| --- | --- |
-| `tools/.env` | Your local settings, copied from `tools/env.example`. Gitignored. **Create this first.** |
-| `profiles.yaml` | Which templates get built, and their flags. |
-| `templates/deb13/` | The cloud-config template and the Debian image pin. |
-| `templates/proxmox-create.sh.tmpl` | The `qm create` script emitted per template. |
-| `tools/build.sh` | Build command. The only thing that writes artifacts. |
-| `tools/validate.sh` | Validate without building. |
-| `build/` | Generated output. Gitignored, rebuilt from scratch every time. |
 
 ## What is in the images
 
@@ -165,7 +164,7 @@ from `download.docker.com` (key pinned to fingerprint
 | --- | --- | --- |
 | User | `admin`, key-only, password locked, `NOPASSWD` sudo, in `adm` and `sudo` | `qm create --ciuser --sshkeys`, verified in `cloud-init-finalize` |
 | Hostname | From the Proxmox VM name, including after cloning and renaming | Proxmox-generated user-data |
-| SSH | Public key only for `admin` from exactly `10.1.10.100`, `10.1.10.101`, `10.1.75.2`, `10.1.2.19`, and `10.1.11.105`; no root; `MaxAuthTries 3`; `LoginGraceTime 30s` | `/etc/ssh/sshd_config.d/99-harden.conf` |
+| SSH | Public key only for `admin`; no root; optional exact source restriction from `SSH_ALLOW_USERS` in `tools/.env`; `MaxAuthTries 3`; `LoginGraceTime 30s` | `/etc/ssh/sshd_config.d/99-harden.conf` |
 | fail2ban | Aggressive `sshd` jail, escalating 30m bans, nftables actions | `/etc/fail2ban/jail.local` |
 | Kernel | Restricted kptr and ptrace, unprivileged BPF off, redirects off, strict `rp_filter = 1`, SYN cookies | `/etc/sysctl.d/20-hardening.conf` |
 | Updates | Debian unattended-upgrades defaults, enabled daily with no automatic reboot | `/etc/apt/apt.conf.d/20auto-upgrades` |
@@ -178,8 +177,8 @@ from `download.docker.com` (key pinned to fingerprint
 | APPDATA | Every VM gets a disk matched by WWN and serial, ext4 labelled `APPDATA`, mounted at `/mnt/appdata` | `bootcmd`, `appdata-verify.service` |
 | First boot | Self-checks the bootstrap and remains running; failures write `/home/admin/logs/` | `cloud-init-post-verify.service` |
 
-`templates/deb13/cloud-config.yml.tmpl` is the authority if this table falls
-behind.
+`templates/deb13/cloud-config.yml.tmpl` owns the public-safe base;
+`SSH_ALLOW_USERS` in `tools/.env` owns optional private SSH source entries.
 
 The SSH source policy uses OpenSSH's additive
 [`AllowUsers USER@HOST`](https://man.openbsd.org/sshd_config#AllowUsers) matching. The two
@@ -221,7 +220,7 @@ and no remote collector is configured or tested. Standard log rotation remains
 owned by the Debian packages.
 
 The `-syslog` profiles deliberately keep their *system* logging state in memory
-and send it to the collector instead. Three properties, and only these three:
+and send it to the collector instead.
 
 - `systemd-journald` runs with `Storage=volatile`, so the journal lives in
   `/run/log/journal`.
@@ -230,32 +229,19 @@ and send it to the collector instead. Three properties, and only these three:
   on-disk rules.
 - fail2ban logs to the journal and keeps its ban database in `/run`.
 
-The only swap device is zram, so nothing pages to disk either. This cuts disk
-writes considerably, but it is narrower than "nothing is written to disk", and
-the boundary is worth being precise about.
+Why memory only logs?
 
-`/var/log` is a **normal persistent directory on every profile**. It is not a
-tmpfs. Anything that writes files there directly still lands on the VM disk —
-`cloud-init.log` and `cloud-init-output.log` among them, along with any
-application or package that does its own file logging rather than going through
-syslog or the journal. That is deliberate: a volatile `/var/log` hides the log
-directories Debian packages create at install time, and services such as nginx,
-Apache and Supervisor fail to start after a reboot when their directory has
-vanished.
+Fewer disk writes, especially if you have many VM's.
 
-What you give up:
+What you give up with Memory Only:
 
 - **An unreachable collector loses messages.** The queue holds about 25,000
   messages in RAM, then discards lowest severity first. There is no catch-up.
 - **A sustained log storm is rate-limited** to 25,000 messages per 60 seconds.
 - **Reboots lose the journal and the syslog stream.** Files an application wrote
   under `/var/log` itself survive.
-- **fail2ban forgets its bans on reboot.** They survive a fail2ban restart.
-- **Retention under `/var/log` is not KASA's.** Rotation there is owned by the
-  application or package, if it configures any at all, and disk usage is no
-  longer capped the way the former 128 MiB tmpfs capped it.
 
-Because the collector matters this much, the first-boot self-test probes it. On
+Because the collector matters, the first-boot self-test probes it. On
 the template build boot an unreachable collector is a warning, so the template
 is still buildable without one. On a clone it is fatal, because the VM would
 otherwise run blind.
