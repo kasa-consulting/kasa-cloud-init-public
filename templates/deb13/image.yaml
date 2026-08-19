@@ -1,8 +1,7 @@
 # Debian cloud image pin for this release directory.
 #
-# To move to a newer build: change build/name/url together, download the image,
-# run `sha512sum` on it, and paste the result here. Never update the build
-# without re-pinning the digest.
+# Managed by tools/debian_image_updater.py. The updater verifies signed SHA512
+# metadata and the downloaded image before changing this immutable pin.
 
 codename: trixie
 build: "20260722-2547"

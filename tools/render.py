@@ -12,6 +12,8 @@ import shlex
 
 import yaml
 
+from debian_image_updater import ImagePinError, load_image_pin
+
 
 ROOT = Path(__file__).resolve().parents[1]
 TEMPLATES = ROOT / "templates"
@@ -196,26 +198,17 @@ def load_image(release: str) -> Image:
     image_file = TEMPLATES / release / "image.yaml"
     if not image_file.is_file():
         raise ValueError(f"Image pin is missing: {image_file}")
-    document = yaml.safe_load(image_file.read_text(encoding="utf-8"))
-    if not isinstance(document, dict):
-        raise ValueError(f"{image_file}: expected a mapping")
-    missing = {"codename", "build", "name", "url", "sha512"} - document.keys()
-    if missing:
-        raise ValueError(f"{image_file}: missing keys: {sorted(missing)}")
-
-    sha512 = str(document["sha512"]).strip()
-    if not re.fullmatch(r"[0-9a-f]{128}", sha512):
-        raise ValueError(f"{image_file}: sha512 must be 128 lowercase hex digits")
-    url = str(document["url"]).strip()
-    if not url.startswith("https://"):
-        raise ValueError(f"{image_file}: url must be https")
+    try:
+        pin = load_image_pin(image_file)
+    except ImagePinError as error:
+        raise ValueError(f"{image_file}: {error}") from error
 
     return Image(
-        codename=str(document["codename"]).strip(),
-        build=str(document["build"]).strip(),
-        name=str(document["name"]).strip(),
-        url=url,
-        sha512=sha512,
+        codename=pin.codename,
+        build=pin.build,
+        name=pin.name,
+        url=pin.url,
+        sha512=pin.sha512,
     )
 
 
