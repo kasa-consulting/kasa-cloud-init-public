@@ -62,7 +62,7 @@ $EDITOR tools/.env
 
 Set at least `SYSLOG_SERVER`, `SYSLOG_PORT`, `FAIL2BAN_IGNORE_IPS`, `BRIDGE`,
 `VMID_START`, and `SSH_PUBLIC_KEY_FILE`. `VMID_START` must begin a range of
-unused VM IDs — one per profile in `profiles.yaml`. If you configure SSH source
+unused VM IDs — one per profile in `templates/profiles.yaml`. If you configure SSH source
 authorization, use exact `admin@IP` entries in `SSH_ALLOW_USERS`.
 
 ```bash
@@ -112,7 +112,7 @@ rebuilding. The script reports this case explicitly rather than half-completing.
 | Path | Purpose |
 | --- | --- |
 | `tools/.env` | Your local settings, copied from `tools/env.example`. Gitignored. **Create this first.** |
-| `profiles.yaml` | Which templates get built, and their flags. |
+| `templates/profiles.yaml` | Which templates get built, and their flags. |
 | `templates/deb13/` | The cloud-config template and the Debian image pin. |
 | `templates/proxmox-create.sh.tmpl` | The `qm create` script emitted per template. |
 | `tools/build.sh` | Build command. The only thing that writes artifacts. |
@@ -121,7 +121,7 @@ rebuilding. The script reports this case explicitly rather than half-completing.
 
 - `templates/deb13/cloud-config.yml.tmpl` is
   one file with `docker` and `remote_syslog` conditionals
-  `profiles.yaml` enumerates the templates that get built.
+  `templates/profiles.yaml` enumerates the templates that get built.
 - `templates/deb13/` holds the cloud-config
   and an `image.yaml` pinning that release's cloud image build and SHA512.
 

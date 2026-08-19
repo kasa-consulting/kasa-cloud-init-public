@@ -16,7 +16,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 TEMPLATES = ROOT / "templates"
 DOCKER_KEY = ROOT / "assets" / "docker-release.asc"
-PROFILE_MANIFEST = ROOT / "profiles.yaml"
+PROFILE_MANIFEST = TEMPLATES / "profiles.yaml"
 LOCAL_CONFIG = ROOT / "tools" / ".env"
 EXAMPLE_CONFIG = ROOT / "tools" / "env.example"
 PRIVATE_SOURCE_MARKER = ROOT / ".kasa-private-source"
