@@ -53,6 +53,8 @@ STRICT_RP_FILTER_KEYS = (
     "net.ipv4.conf.all.rp_filter",
     "net.ipv4.conf.default.rp_filter",
 )
+HARDENING_SYSCTL_PATH = "/etc/sysctl.d/60-hardening.conf"
+VENDOR_SYSCTL_BASELINE = "50-default.conf"
 
 # Paths that must appear only in the docker profile.
 DOCKER_ONLY_PATHS = (
@@ -187,12 +189,18 @@ def validate_ssh_source_restriction(profile: Profile, document: dict) -> None:
 
 
 def validate_strict_rp_filter(profile: Profile, document: dict) -> None:
-    """Require one strict reverse-path-filter assignment for each governed key."""
+    """Require strict rp_filter values to win generated sysctl load order."""
     name = profile.name
-    hardening = files_by_path(document).get(
-        "/etc/sysctl.d/20-hardening.conf", {}
-    ).get("content", "")
+    files = files_by_path(document)
+    hardening = files.get(HARDENING_SYSCTL_PATH, {}).get("content", "")
     active = strip_comments(hardening)
+    hardening_name = Path(HARDENING_SYSCTL_PATH).name
+
+    if hardening_name <= VENDOR_SYSCTL_BASELINE:
+        report(
+            name,
+            f"{HARDENING_SYSCTL_PATH} must sort after {VENDOR_SYSCTL_BASELINE}",
+        )
 
     for key in STRICT_RP_FILTER_KEYS:
         values = re.findall(
@@ -206,6 +214,26 @@ def validate_strict_rp_filter(profile: Profile, document: dict) -> None:
                 f"{key} must have exactly one active strict-mode assignment (= 1); "
                 f"found {values}",
             )
+
+        for path, entry in sorted(files.items()):
+            candidate = Path(path)
+            if (
+                candidate.parent.name != "sysctl.d"
+                or candidate.suffix != ".conf"
+                or candidate.name <= hardening_name
+            ):
+                continue
+            later_values = re.findall(
+                rf"^\s*{re.escape(key)}\s*=\s*(\S+)\s*$",
+                strip_comments(entry.get("content", "")),
+                re.MULTILINE,
+            )
+            if later_values:
+                report(
+                    name,
+                    f"{path} sorts after {HARDENING_SYSCTL_PATH} and reassigns "
+                    f"{key}: {later_values}",
+                )
 
 
 def validate_common(profile: Profile, document: dict, rendered: str) -> None:
@@ -250,7 +278,7 @@ def validate_common(profile: Profile, document: dict, rendered: str) -> None:
     for required_path in (
         "/etc/kasa-image-release",
         "/etc/ssh/sshd_config.d/99-harden.conf",
-        "/etc/sysctl.d/20-hardening.conf",
+        HARDENING_SYSCTL_PATH,
         "/etc/systemd/zram-generator.conf",
         "/etc/fail2ban/jail.local",
         "/usr/local/sbin/cloud-init-finalize",
@@ -280,7 +308,7 @@ def validate_common(profile: Profile, document: dict, rendered: str) -> None:
         if directive not in sshd:
             report(name, f"sshd hardening is missing: {directive}")
 
-    hardening = files.get("/etc/sysctl.d/20-hardening.conf", {}).get("content", "")
+    hardening = files.get(HARDENING_SYSCTL_PATH, {}).get("content", "")
     for setting in (
         "kernel.kptr_restrict = 2",
         "kernel.yama.ptrace_scope = 1",
@@ -300,6 +328,14 @@ def validate_common(profile: Profile, document: dict, rendered: str) -> None:
     finalize = files.get("/usr/local/sbin/cloud-init-finalize", {}).get("content", "")
     if "/usr/lib/systemd/systemd-sysctl" not in finalize:
         report(name, "finalize must apply systemd sysctl glob settings")
+    for fragment in (
+        "for rp_filter_key in",
+        *STRICT_RP_FILTER_KEYS,
+        'rp_filter_value="$(/usr/sbin/sysctl -n "$rp_filter_key")"',
+        '[ "$rp_filter_value" = 1 ]',
+    ):
+        if fragment not in finalize:
+            report(name, f"finalize live rp_filter verification is missing: {fragment}")
 
     zram = files.get("/etc/systemd/zram-generator.conf", {}).get("content", "")
     if "compression-algorithm = zstd" not in zram or "zram-size" not in zram:

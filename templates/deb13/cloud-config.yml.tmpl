@@ -130,7 +130,9 @@ write_files:
   # kernel.apparmor_restrict_unprivileged_userns=1). Debian 13 leaves
   # unprivileged user namespaces open, and the docker profile's rootless
   # daemon depends on them. Restricting them breaks Docker on this image.
-  - path: /etc/sysctl.d/20-hardening.conf
+  # Debian's /usr/lib/sysctl.d/50-default.conf sets rp_filter after lower-sorting
+  # files, so this drop-in must sort later for the strict values to be effective.
+  - path: /etc/sysctl.d/60-hardening.conf
     owner: root:root
     permissions: "0644"
     content: |
@@ -754,6 +756,15 @@ write_files:
 
       systemctl daemon-reload
       /usr/lib/systemd/systemd-sysctl
+      for rp_filter_key in \
+        net.ipv4.conf.all.rp_filter \
+        net.ipv4.conf.default.rp_filter; do
+        rp_filter_value="$(/usr/sbin/sysctl -n "$rp_filter_key")"
+        [ "$rp_filter_value" = 1 ] || {
+          echo "$rp_filter_key is not strict after systemd-sysctl: $rp_filter_value" >&2
+          on_error 1 "$LINENO"
+        }
+      done
       systemctl start dev-zram0.swap
       systemctl is-active --quiet dev-zram0.swap
 

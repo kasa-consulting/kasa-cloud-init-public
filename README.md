@@ -166,7 +166,7 @@ from `download.docker.com` (key pinned to fingerprint
 | Hostname | From the Proxmox VM name, including after cloning and renaming | Proxmox-generated user-data |
 | SSH | Public key only for `admin`; no root; optional exact source restriction from `SSH_ALLOW_USERS` in `tools/.env`; `MaxAuthTries 3`; `LoginGraceTime 30s` | `/etc/ssh/sshd_config.d/99-harden.conf` |
 | fail2ban | Aggressive `sshd` jail, escalating 30m bans, nftables actions | `/etc/fail2ban/jail.local` |
-| Kernel | Restricted kptr and ptrace, unprivileged BPF off, redirects off, strict `rp_filter = 1`, SYN cookies | `/etc/sysctl.d/20-hardening.conf` |
+| Kernel | Restricted kptr and ptrace, unprivileged BPF off, redirects off, strict `rp_filter = 1`, SYN cookies | `/etc/sysctl.d/60-hardening.conf` |
 | Updates | Debian unattended-upgrades defaults, enabled daily with no automatic reboot | `/etc/apt/apt.conf.d/20auto-upgrades` |
 | Swap | zram only, `min(ram / 2, 512)` with zstd, `vm.swappiness = 100` | `/etc/systemd/zram-generator.conf` |
 | Disk | Root grows on first boot, `fstrim.timer` enabled | cloud-init `growpart` |
