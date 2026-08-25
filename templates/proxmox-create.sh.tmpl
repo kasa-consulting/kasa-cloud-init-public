@@ -8,6 +8,7 @@ CPU=@@CPU@@
 MEM_MIN=@@MEM_MIN@@
 MEM_MAX=@@MEM_MAX@@
 BRIDGE=@@BRIDGE@@
+VLAN_TAG=@@VLAN_TAG@@
 VM_STORAGE_NAME=@@VM_STORAGE_NAME@@
 SNIPPET_STORAGE_NAME=@@SNIPPET_STORAGE_NAME@@
 ISO_STORAGE_PATH=@@ISO_STORAGE_PATH@@
@@ -124,9 +125,17 @@ cleanup() {
   [ -z "$ssh_key_file" ] || rm -f -- "$ssh_key_file"
   if [ "$original_exit_code" -ne 0 ] && \
     [ "$vm_created" -eq 1 ] && [ -n "$current_vmid" ]; then
-    echo "Removing VM $current_vmid created by the failed invocation" >&2
-    qm destroy "$current_vmid" --purge 1 >/dev/null 2>&1 || \
-      echo "WARNING: could not remove partial VM $current_vmid" >&2
+    # vm_created is armed before qm create runs, because a create that fails
+    # part-way still leaves a VM to remove. A create that fails atomically --
+    # a key Proxmox rejects, for one -- leaves nothing, so ask the node what
+    # exists rather than announcing a removal that has nothing to remove.
+    if qm config "$current_vmid" >/dev/null 2>&1; then
+      echo "Removing VM $current_vmid created by the failed invocation" >&2
+      qm destroy "$current_vmid" --purge 1 >/dev/null 2>&1 || \
+        echo "WARNING: could not remove partial VM $current_vmid" >&2
+    else
+      echo "No VM $current_vmid exists; the failed invocation left nothing behind" >&2
+    fi
   fi
   exit "$original_exit_code"
 }
@@ -155,6 +164,11 @@ printf '%s\n' "$SSH_PUBLIC_KEY" > "$ssh_key_file"
 ssh-keygen -l -f "$ssh_key_file" >/dev/null
 #% endif
 
+net0="virtio,bridge=${BRIDGE},queues=${CPU},firewall=1"
+if [ -n "$VLAN_TAG" ]; then
+  net0="${net0},tag=${VLAN_TAG}"
+fi
+
 create_template() {
   local vmid="$1"
   local name="$2"
@@ -168,8 +182,11 @@ create_template() {
     --cpu host \
     --memory "$MEM_MAX" \
     --balloon "$MEM_MIN" \
-    --net0 "virtio,bridge=${BRIDGE},queues=${CPU},firewall=1" \
+    --net0 "$net0" \
     --scsihw virtio-scsi-single \
+    --machine q35 \
+    --bios ovmf \
+    --efidisk0 "${VM_STORAGE_NAME}:1,efitype=4m,pre-enrolled-keys=1" \
     --serial0 socket \
     --vga serial0 \
     --cicustom "vendor=${vendor_volume}" \

@@ -153,6 +153,7 @@ def render_command(
         "@@MEM_MIN@@": CONFIG["MEM_MIN"],
         "@@MEM_MAX@@": CONFIG["MEM_MAX"],
         "@@BRIDGE@@": CONFIG["BRIDGE"],
+        "@@VLAN_TAG@@": CONFIG["VLAN_TAG"],
         "@@VM_STORAGE_NAME@@": CONFIG["VM_STORAGE_NAME"],
         "@@SNIPPET_STORAGE_NAME@@": CONFIG["SNIPPET_STORAGE_NAME"],
         "@@ISO_STORAGE_PATH@@": CONFIG["ISO_STORAGE_PATH"],
@@ -339,6 +340,30 @@ def validate_generated_command(vendor: VendorArtifact, command: str) -> None:
         fail("generated Proxmox command must not tell the operator the VM powers off")
     if "the VM remains running afterward" not in command:
         fail("generated Proxmox command must describe first-boot running state")
+
+    # The NIC is one line of shell, and getting it wrong is silent: a template on a
+    # trunk bridge with no tag comes up with a link and no network, which looks like a
+    # cloud-init failure rather than a missing option.
+    if command.count("--net0") != 1:
+        fail("generated Proxmox command must configure exactly one NIC")
+    if f"VLAN_TAG={shlex.quote(CONFIG['VLAN_TAG'])}" not in command:
+        fail("generated Proxmox command must carry the configured VLAN_TAG")
+    if "tag=${VLAN_TAG}" not in command:
+        fail("generated Proxmox command must tag the NIC when a VLAN is configured")
+
+    # UEFI, and the EFI variable store it needs. A template booted through OVMF without
+    # an efidisk0 keeps its boot entries nowhere, so it survives the build and fails on
+    # the first clone that reboots.
+    if "--bios ovmf" not in command:
+        fail("generated Proxmox command must boot the template through OVMF")
+    if "seabios" in command:
+        fail("generated Proxmox command must not select the legacy BIOS")
+    if command.count("--efidisk0") != 1:
+        fail("generated Proxmox command must attach exactly one EFI disk")
+    if "efitype=4m" not in command:
+        fail("generated Proxmox command must use the 4m EFI variable store")
+    if "pre-enrolled-keys=1" not in command:
+        fail("generated Proxmox command must enrol the Secure Boot keys")
 
     validate_injected_keys(f"{vendor.template_name} create script", command)
 

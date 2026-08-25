@@ -75,6 +75,12 @@ Set at least `SYSLOG_SERVER`, `SYSLOG_PORT`, `FAIL2BAN_IGNORE_IPS`, `BRIDGE`,
 unused VM IDs — one per profile in `templates/profiles.yaml`. If you configure SSH source
 authorization, use exact `admin@IP` entries in `SSH_ALLOW_USERS`.
 
+If `BRIDGE` is a VLAN trunk rather than an access port, set `VLAN_TAG` as well.
+An empty tag leaves the NIC untagged, and an untagged interface on a trunk comes
+up with a link and no network — which reads from inside the guest as a failed
+bootstrap rather than a missing tag. `LXC_VLAN_TAG` is the container counterpart
+and is set separately.
+
 ```bash
 ./tools/validate.sh          # structure and content checks
 ./tools/validate.sh --full   # also runs cloud-init, rsyslogd, yamllint, shellcheck
@@ -104,6 +110,25 @@ bash create-kasa-deb13-docker-syslog.sh
 
 For durable local logging, use `create-kasa-deb13-base.sh` or
 `create-kasa-deb13-docker.sh` instead.
+
+Each template boots through UEFI with Secure Boot enforced: the script sets
+`bios: ovmf` on a `q35` machine and attaches a 4 MB EFI variable store as
+`efidisk0` with Microsoft's keys enrolled. The pinned Debian cloud image is
+hybrid-bootable and ships a signed shim and grub, so nothing inside the guest
+changes. Enforcing it also puts the kernel in lockdown `integrity`, which blocks
+unsigned module loading, `/dev/mem` and kexec.
+
+Two limits worth stating plainly. Debian does not sign the initramfs here, so
+this is not a complete boot-integrity story — a guest-root attacker can still
+persist through `/boot/initrd.img`. And no vTPM is attached, so nothing consumes
+the boot measurements. Treat it as hardening, not attestation.
+
+If a guest needs an out-of-tree kernel module it will fail to load. Give that one
+clone its own unenforced variable store rather than weakening the template:
+
+```bash
+qm set VMID --efidisk0 STORAGE:1,efitype=4m,pre-enrolled-keys=0
+```
 
 Each script downloads and verifies the Debian image, checks the VM ID is free,
 and creates the template. Boot it once: a successful first boot leaves the VM

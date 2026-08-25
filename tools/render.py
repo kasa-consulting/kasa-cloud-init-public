@@ -96,7 +96,16 @@ TRUST_KEY_DEFAULTS = {
 }
 TRUST_KEYS = frozenset(TRUST_KEY_DEFAULTS)
 
-CONFIG_KEYS = SITE_KEYS | BUILD_KEYS | LXC_KEYS | TRUST_KEYS
+# VLAN_TAG is optional for the same reason: an existing tools/.env predates it, and a
+# missing key must mean "untagged on BRIDGE" -- the behaviour every template built so far
+# already has -- rather than fail a build that worked yesterday. It is the VM counterpart
+# of LXC_VLAN_TAG and is validated the same way.
+NETWORK_KEY_DEFAULTS = {
+    "VLAN_TAG": "",
+}
+NETWORK_KEYS = frozenset(NETWORK_KEY_DEFAULTS)
+
+CONFIG_KEYS = SITE_KEYS | BUILD_KEYS | LXC_KEYS | TRUST_KEYS | NETWORK_KEYS
 
 # An empty value means "not configured" rather than a malformed line.
 #
@@ -112,6 +121,7 @@ OPTIONAL_EMPTY_KEYS = frozenset(
         "KASA_ROOT_CA_FILE",
         "LXC_VLAN_TAG",
         "LXC_NAMESERVER",
+        "VLAN_TAG",
     }
 )
 
@@ -352,15 +362,21 @@ def load_config(profiles: tuple[Profile, ...]) -> dict[str, str]:
             raw_value, line_number, allow_empty=key in OPTIONAL_EMPTY_KEYS
         )
 
-    missing = sorted(CONFIG_KEYS - LXC_KEYS - TRUST_KEYS - values.keys())
+    missing = sorted(CONFIG_KEYS - LXC_KEYS - TRUST_KEYS - NETWORK_KEYS - values.keys())
     if missing:
         raise ValueError(f"{CONFIG_FILE}: missing required keys: {missing}")
-    for defaults in (LXC_KEY_DEFAULTS, TRUST_KEY_DEFAULTS):
+    for defaults in (LXC_KEY_DEFAULTS, TRUST_KEY_DEFAULTS, NETWORK_KEY_DEFAULTS):
         for key, default in defaults.items():
             values.setdefault(key, default)
 
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}", values["BRIDGE"]):
         raise ValueError(f"{CONFIG_FILE}: BRIDGE contains unsupported characters")
+
+    vm_vlan_tag = values["VLAN_TAG"]
+    if vm_vlan_tag and not (vm_vlan_tag.isdigit() and 1 <= int(vm_vlan_tag) <= 4094):
+        raise ValueError(
+            f"{CONFIG_FILE}: VLAN_TAG must be a VLAN ID between 1 and 4094"
+        )
 
     try:
         ipaddress.ip_address(values["SYSLOG_SERVER"])
