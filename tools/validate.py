@@ -19,8 +19,10 @@ import sys
 import yaml
 
 from build import (
+    lxc_artifacts,
     render_command,
     validate_generated_command,
+    validate_generated_lxc,
     vendor_artifacts,
 )
 from render import (
@@ -32,6 +34,7 @@ from render import (
     SSH_ALLOW_USERS,
     Profile,
     load_image,
+    lxc_template_name,
     render,
     template_name,
 )
@@ -829,6 +832,714 @@ def validate_docker_rootless(profile: Profile, document: dict) -> None:
         report(name, f"hardcoded uid {match} in /run/user path; derive it with id -u")
 
 
+# --- LXC profile checks ------------------------------------------------------
+# The container artifacts are shell, not YAML, so these read rendered text
+# rather than a parsed document. Everything else follows the house style:
+# comment-stripped, so a commented directive never satisfies a positive check
+# and an explanatory comment never trips a negative one, and every profile-only
+# feature gets a matching assertion that the other profiles do not carry it.
+
+LXC_APPDATA = "/mnt/appdata"
+
+# VM mechanisms. A container shares the host kernel and never sees a raw
+# device, so each of these would describe hardware it cannot reach.
+LXC_FORBIDDEN_FRAGMENTS = (
+    "qemu-guest-agent",
+    "cloud-init",
+    "cloud-guest-utils",
+    "growpart",
+    "resize_rootfs",
+    "zram",
+    "/dev/disk/by-id",
+    "mkfs",
+    "wipefs",
+    "fstrim.timer",
+    "vm.swappiness",
+    "APPDATA_WWN",
+    "APPDATA_SERIAL",
+    "lsblk",
+    "blkid",
+)
+
+# Settings a container cannot own. Writing them here would either fail or be
+# silently ignored; they belong on the Proxmox host and are documented there.
+LXC_HOST_OWNED_SYSCTL_PREFIXES = ("kernel.", "fs.", "vm.", "user.")
+
+# For both redirect settings the kernel ORs conf/all with conf/<interface>, so
+# `all = 0` on its own leaves an existing eth0 or docker0 at its default of 1.
+# The wildcard is what reaches those interfaces. rp_filter is deliberately not
+# here: it takes the maximum of all and the interface, so all = 1 is enough.
+LXC_REQUIRED_WILDCARD_SYSCTLS = (
+    "net.ipv4.conf.*.accept_redirects = 0",
+    "net.ipv4.conf.*.send_redirects = 0",
+    "net.ipv6.conf.*.accept_redirects = 0",
+)
+
+LXC_REQUIRED_SSHD_DIRECTIVES = (
+    "PasswordAuthentication no",
+    "PermitRootLogin no",
+    "AuthenticationMethods publickey",
+    "KbdInteractiveAuthentication no",
+    "PermitUserEnvironment no",
+    "AllowAgentForwarding no",
+    "X11Forwarding no",
+    "PrintLastLog yes",
+    "MaxAuthTries 3",
+    "LoginGraceTime 30s",
+    "MaxSessions 5",
+    "MaxStartups 10:30:100",
+)
+
+LXC_DOCKER_PACKAGES = frozenset(
+    {
+        "containerd.io",
+        "docker-buildx-plugin",
+        "docker-ce",
+        "docker-ce-cli",
+        "docker-compose-plugin",
+    }
+)
+
+# The VM installs these only because its Docker is rootless. Carrying them into
+# a container that runs a rootful daemon would be cargo, not parity.
+LXC_ROOTLESS_ONLY_PACKAGES = frozenset(
+    {
+        "docker-ce-rootless-extras",
+        "uidmap",
+        "slirp4netns",
+        "dbus-user-session",
+    }
+)
+
+# Units whose configuration this bootstrap rewrites. `systemctl enable --now`
+# starts a stopped unit but is a no-op for a running one, so on a re-run these
+# would keep serving the configuration that was just replaced -- and any check
+# that follows would exercise the old policy while reporting the new one. The
+# bootstrap advertises that re-running is safe, which has to mean it converges,
+# not merely that it does not crash.
+LXC_RECONFIGURED_UNITS = (
+    "containerd.service",
+    "docker.service",
+    "fail2ban.service",
+    "kasa-appdata-guard.service",
+    "rsyslog.service",
+    "ssh.service",
+)
+
+LXC_PROVENANCE_KEYS = (
+    "ID",
+    "DESCRIPTION",
+    "RELEASE",
+    "EXPECTED_LXC_TEMPLATE",
+    "DOCKER",
+    "LOGGING",
+    "SOURCE_COMMIT",
+    "SOURCE_TREE_DIRTY",
+    "RENDERED_AT",
+    "BOOTSTRAPPED_AT",
+)
+
+
+def lxc_written_file(bootstrap: str, path: str) -> str:
+    """Return the content the bootstrap writes to one path.
+
+    Configuration goes in through `install_file <path> <mode> <<EOF`, so a check
+    can look at one file on its own instead of at the whole script, where an
+    unrelated line could satisfy it.
+    """
+    match = re.search(
+        rf"^install_file {re.escape(path)} [0-7]{{4}} <<'?(\w+)'?\n(.*?)^\1$",
+        bootstrap,
+        re.MULTILINE | re.DOTALL,
+    )
+    return match.group(2) if match else ""
+
+
+def lxc_installed_packages(bootstrap: str) -> set[str]:
+    """Collect the packages the bootstrap installs.
+
+    Compared as whole tokens on purpose: `"docker-ce" in text` cannot tell a
+    missing docker-ce from a present docker-ce-cli.
+    """
+    packages: set[str] = set()
+    # Walk backslash continuations explicitly. A greedy [^\n]* would swallow the
+    # trailing backslash, match zero continuations, and succeed on line one.
+    for match in re.finditer(r"apt-get install(?:[^\n\\]|\\\n)*", bootstrap):
+        for token in match.group(0).split():
+            if token in ("apt-get", "install", "\\") or token.startswith("-"):
+                continue
+            packages.add(token)
+    return packages
+
+
+def validate_lxc_ssh(profile: Profile, bootstrap: str) -> None:
+    """Require the VM's sshd policy, and require it to land safely."""
+    name = profile.name
+    sshd = lxc_written_file(bootstrap, "/etc/ssh/sshd_config.d/99-harden.conf")
+    if not sshd:
+        report(name, "the LXC bootstrap does not write the sshd hardening drop-in")
+        return
+
+    stripped = strip_comments(sshd)
+    for directive in LXC_REQUIRED_SSHD_DIRECTIVES:
+        if directive not in stripped:
+            report(name, f"LXC sshd policy is missing: {directive}")
+
+    entries: list[str] = []
+    for line in stripped.splitlines():
+        fields = line.split()
+        if fields and fields[0].lower() == "allowusers":
+            entries.extend(fields[1:])
+    if len(entries) != len(SSH_ALLOW_USERS) or set(entries) != set(SSH_ALLOW_USERS):
+        report(
+            name,
+            "LXC AllowUsers must match the private policy exactly: "
+            + (" ".join(SSH_ALLOW_USERS) or "no active entries"),
+        )
+
+    body = strip_comments(bootstrap)
+
+    # A container whose sshd configuration is loaded before admin can use it is
+    # a container nobody can log into. Order is the whole control here.
+    for fragment, message in (
+        ("ssh-keygen -l -f", "must validate SSH keys with ssh-keygen"),
+        ("/usr/sbin/sshd -t", "must test the sshd configuration before loading it"),
+        ("visudo -cf /etc/sudoers.d/90-admin", "must validate sudo with visudo"),
+        ("admin ALL=(ALL) NOPASSWD:ALL", "must grant admin passwordless sudo"),
+        ("useradd --create-home --shell /bin/bash", "must create the admin account"),
+        ("--groups adm,sudo", "must place admin in adm and sudo"),
+        ("usermod --lock admin", "must lock the admin password"),
+        ("/home/admin/apps", "must create /home/admin/apps"),
+        ("install -d -m 0700 -o admin -g admin /home/admin/.ssh", "must create .ssh 0700"),
+        ("install -m 0600 -o admin -g admin", "must install authorized_keys 0600"),
+        ("chmod 0700 /home/admin", "must set /home/admin to 0700"),
+        ("sshd -T", "must read the effective sshd policy back"),
+    ):
+        if fragment not in body:
+            report(name, f"the LXC bootstrap {message}")
+
+    for earlier, later, message in (
+        (
+            "install -m 0600 -o admin -g admin",
+            "systemctl reload-or-restart ssh.service",
+            "admin's key must be installed before sshd is reloaded",
+        ),
+        (
+            "visudo -cf /etc/sudoers.d/90-admin",
+            "systemctl reload-or-restart ssh.service",
+            "sudo must be validated before sshd is reloaded",
+        ),
+        (
+            "/usr/sbin/sshd -t",
+            "systemctl reload-or-restart ssh.service",
+            "sshd -t must run before sshd is reloaded",
+        ),
+    ):
+        if earlier in body and later in body and body.index(earlier) > body.index(later):
+            report(name, f"LXC bootstrap ordering: {message}")
+
+
+def validate_lxc_sysctl(profile: Profile, bootstrap: str) -> None:
+    """Require strict rp_filter and only container-owned keys."""
+    name = profile.name
+    path = "/etc/sysctl.d/60-hardening.conf"
+    sysctl = lxc_written_file(bootstrap, path)
+    if not sysctl:
+        report(name, "the LXC bootstrap does not write the hardening sysctl file")
+        return
+
+    # Debian's own 50-default.conf sets rp_filter, so a lower-sorting name would
+    # lose to it and the strict value would never take effect.
+    if Path(path).name <= VENDOR_SYSCTL_BASELINE:
+        report(name, f"LXC {path} must sort after {VENDOR_SYSCTL_BASELINE}")
+
+    stripped = strip_comments(sysctl)
+    for key in STRICT_RP_FILTER_KEYS:
+        assignments = re.findall(
+            rf"^\s*{re.escape(key)}\s*=\s*(\S+)\s*$", stripped, re.MULTILINE
+        )
+        if assignments != ["1"]:
+            report(
+                name,
+                f"LXC {key} must have exactly one strict assignment of 1, "
+                f"found {assignments or 'none'}",
+            )
+
+    for line in stripped.splitlines():
+        key = line.split("=")[0].strip()
+        if key and any(key.startswith(p) for p in LXC_HOST_OWNED_SYSCTL_PREFIXES):
+            report(
+                name,
+                f"LXC sysctl file sets {key}, which the Proxmox host owns; a "
+                "container cannot change it and must not appear to",
+            )
+
+    for setting in LXC_REQUIRED_WILDCARD_SYSCTLS:
+        if setting not in stripped:
+            report(
+                name,
+                f"LXC sysctl file is missing {setting!r}; without the per-interface "
+                "wildcard the kernel ORs conf/all with each interface, and an "
+                "existing eth0 or docker0 keeps redirects enabled",
+            )
+
+    body = strip_comments(bootstrap)
+    if "/usr/lib/systemd/systemd-sysctl" not in body:
+        report(name, "the LXC bootstrap must apply sysctls with systemd-sysctl")
+    # Verifying all/default proves nothing about the interfaces carrying traffic.
+    if "/proc/sys/net/ipv4/conf /proc/sys/net/ipv6/conf" not in body:
+        report(
+            name,
+            "the LXC bootstrap must verify redirect settings on every interface, "
+            "not only the all and default aggregates",
+        )
+    # Reading the values back is what turns "we wrote a file" into "the setting
+    # is in effect"; a suppressed failure there would hide exactly that gap.
+    if 'got=$(/usr/sbin/sysctl -n "$key")' not in body:
+        report(name, "the LXC bootstrap must read each sysctl back after applying it")
+    if re.search(r"sysctl[^\n]*\|\|\s*true", body):
+        report(name, "the LXC bootstrap must not suppress a sysctl failure with || true")
+
+
+def validate_lxc_packages(profile: Profile, bootstrap: str) -> None:
+    """Match the VM's first-boot upgrade, and get the trust order right."""
+    name = profile.name
+    body = strip_comments(bootstrap)
+
+    # The VM sets package_update and package_upgrade. A hand-pinned container
+    # template can be months old, so skipping this would leave a finished
+    # bootstrap sitting on stale packages.
+    if "apt-get dist-upgrade" not in body:
+        report(
+            name,
+            "the LXC bootstrap must upgrade the base system, matching the VM's "
+            "package_upgrade",
+        )
+
+    if not profile.docker:
+        return
+
+    # ca-certificates must be in place before apt trusts a third-party HTTPS
+    # repository, which is also the order Docker's own instructions use.
+    certificates = body.find("no-install-recommends ca-certificates")
+    docker_source = body.find("install_file /etc/apt/sources.list.d/docker.sources")
+    if certificates == -1:
+        report(name, "the LXC bootstrap must install ca-certificates explicitly")
+    elif docker_source != -1 and certificates > docker_source:
+        report(
+            name,
+            "ca-certificates must be installed before Docker's HTTPS repository "
+            "is configured",
+        )
+
+
+def validate_lxc_logging(profile: Profile, bootstrap: str) -> None:
+    """Port the VM's logging policy, including what the local profiles omit."""
+    name = profile.name
+    remote = lxc_written_file(bootstrap, "/etc/rsyslog.d/01-remote.conf")
+    journald = lxc_written_file(
+        bootstrap, "/etc/systemd/journald.conf.d/60-remote-syslog.conf"
+    )
+    fail2ban_local = lxc_written_file(bootstrap, "/etc/fail2ban/fail2ban.local")
+    body = strip_comments(bootstrap)
+
+    if not profile.remote_syslog:
+        if remote:
+            report(name, "a local-logging LXC profile must not forward to a collector")
+        if journald:
+            report(name, "a local-logging LXC profile must keep the journal durable")
+        if fail2ban_local:
+            report(name, "a local-logging LXC profile must keep fail2ban state on disk")
+        if "Storage=volatile" in body:
+            report(name, "a local-logging LXC profile must not make the journal volatile")
+        if "/dev/tcp/" in body:
+            report(name, "a local-logging LXC profile must not probe a collector")
+        return
+
+    if not remote:
+        report(name, "a remote-syslog LXC profile must write /etc/rsyslog.d/01-remote.conf")
+        return
+
+    for fragment in REQUIRED_RSYSLOG_FRAGMENTS:
+        if fragment not in remote:
+            report(name, f"LXC remote rsyslog config is missing: {fragment}")
+    for fragment in FORBIDDEN_RSYSLOG_FRAGMENTS:
+        if fragment in strip_comments(remote):
+            report(
+                name,
+                f"LXC remote rsyslog config must not spool to disk: found {fragment}",
+            )
+    for fragment in FORBIDDEN_TLS_FRAGMENTS:
+        if fragment in remote:
+            report(name, f"LXC remote rsyslog config must not configure TLS: {fragment}")
+    if f'target="{SITE["SYSLOG_SERVER"]}"' not in remote:
+        report(name, "LXC remote rsyslog target does not match the configured collector")
+    if f'port="{SITE["SYSLOG_PORT"]}"' not in remote:
+        report(name, "LXC remote rsyslog port does not match the configured collector")
+    if strip_comments(remote).strip().splitlines()[-1].strip() != "stop":
+        report(
+            name,
+            "LXC remote rsyslog config must end in stop, or messages continue "
+            "into Debian's on-disk actions",
+        )
+
+    if "Storage=volatile" not in journald:
+        report(name, "a remote-syslog LXC profile must set journald Storage=volatile")
+    if "RuntimeMaxUse=64M" not in journald:
+        report(name, "a remote-syslog LXC profile must cap the runtime journal at 64M")
+    if "ForwardToSyslog=no" not in journald:
+        report(name, "a remote-syslog LXC profile must not forward journal to syslog")
+    if not re.search(r"(?mi)^\s*dbfile\s*=\s*/run/", fail2ban_local):
+        report(name, "a remote-syslog LXC profile must keep fail2ban state under /run")
+    if not re.search(r"(?mi)^\s*logtarget\s*=\s*SYSTEMD-JOURNAL", fail2ban_local):
+        report(name, "a remote-syslog LXC profile must send fail2ban logs to the journal")
+
+    # The container is live, not a template being built, so an unreachable
+    # collector has to stop the run before the journal goes volatile.
+    if "/dev/tcp/" not in body:
+        report(name, "a remote-syslog LXC profile must test collector reachability")
+    if "/run/rsyslog/imjournal.state" not in body:
+        report(name, "a remote-syslog LXC profile must verify the imjournal state file")
+
+
+def validate_lxc_var_log(profile: Profile, bootstrap: str) -> None:
+    """/var/log stays on disk. A tmpfs there loses package log directories."""
+    body = strip_comments(bootstrap)
+    for pattern in VAR_LOG_TMPFS_COMMANDS:
+        if pattern.search(body):
+            report(profile.name, "the LXC bootstrap must not put /var/log on a tmpfs")
+
+
+def validate_lxc_appdata(profile: Profile, bootstrap: str) -> None:
+    """APPDATA is a Proxmox-managed mount the container only ever checks."""
+    name = profile.name
+    body = strip_comments(bootstrap)
+    for fragment, message in (
+        ("/usr/local/sbin/kasa-appdata-guard", "must install the APPDATA guard"),
+        ('mountpoint -q -- "$APPDATA_MOUNT"', "must require APPDATA to be mounted"),
+        ("kasa-appdata-guard.service", "must install the APPDATA guard unit"),
+        (f"RequiresMountsFor={LXC_APPDATA}", "must order the guard after the mount"),
+    ):
+        if fragment not in body:
+            report(name, f"the LXC bootstrap {message}")
+
+
+def validate_lxc_omissions(profile: Profile, bootstrap: str) -> None:
+    """Refuse VM-only mechanisms a container cannot honour."""
+    body = strip_comments(bootstrap)
+    for fragment in LXC_FORBIDDEN_FRAGMENTS:
+        if fragment in body:
+            report(
+                profile.name,
+                f"the LXC bootstrap carries the VM-only mechanism {fragment!r}",
+            )
+
+
+def validate_lxc_fail2ban(profile: Profile, bootstrap: str) -> None:
+    """fail2ban that cannot enforce is not a control, so prove a ban lands."""
+    name = profile.name
+    jail = lxc_written_file(bootstrap, "/etc/fail2ban/jail.local")
+    if not jail:
+        report(name, "the LXC bootstrap does not configure fail2ban")
+        return
+    if "banaction = nftables-multiport" not in jail:
+        report(name, "LXC fail2ban must ban through nftables")
+    if "dummy" in jail:
+        report(
+            name,
+            "LXC fail2ban must not use the dummy action, which detects without "
+            "blocking and would be presented as a working control",
+        )
+    if "backend = systemd" not in jail:
+        report(name, "LXC fail2ban must read the journal")
+    if f"ignoreip = {SITE['FAIL2BAN_IGNORE_IPS']}" not in jail:
+        report(name, "LXC fail2ban ignoreip does not match the configured value")
+
+    body = strip_comments(bootstrap)
+    if "fail2ban-client -t" not in body:
+        report(name, "the LXC bootstrap must validate the fail2ban configuration")
+    if "banip" not in body or "nft list ruleset" not in body:
+        report(
+            name,
+            "the LXC bootstrap must prove a fail2ban ban reaches nftables rather "
+            "than only checking that the service started",
+        )
+
+
+def validate_lxc_docker(profile: Profile, bootstrap: str) -> None:
+    """Docker belongs to the Docker profiles and nowhere else."""
+    name = profile.name
+    body = strip_comments(bootstrap)
+    daemon = lxc_written_file(bootstrap, "/etc/docker/daemon.json")
+    sources = lxc_written_file(bootstrap, "/etc/apt/sources.list.d/docker.sources")
+
+    packages = lxc_installed_packages(bootstrap)
+
+    if not profile.docker:
+        for package in sorted(LXC_DOCKER_PACKAGES & packages):
+            report(name, f"a base LXC profile must not install {package}")
+        if daemon or sources:
+            report(name, "a base LXC profile must not configure Docker")
+        for fragment in ("/etc/containerd", f"{LXC_APPDATA}/docker", "keyctl", "nesting"):
+            if fragment in body:
+                report(name, f"a base LXC profile must not reference {fragment}")
+        return
+
+    for package in sorted(LXC_DOCKER_PACKAGES - packages):
+        report(name, f"the Docker LXC profile must install {package}")
+    for package in sorted(LXC_ROOTLESS_ONLY_PACKAGES & packages):
+        report(
+            name,
+            f"{package} exists only for the VM's rootless Docker; this profile "
+            "runs a rootful daemon inside an unprivileged container",
+        )
+
+    if "Suites: trixie" not in sources:
+        report(name, "the Docker LXC profile must use Docker's trixie repository")
+    if "docker.io" in packages:
+        report(name, "the Docker LXC profile must not install Debian's docker.io")
+    if not lxc_written_file(bootstrap, "/etc/apt/keyrings/docker.asc"):
+        report(name, "the Docker LXC profile must pin Docker's signing key")
+
+    if f'"data-root": "{LXC_APPDATA}/docker"' not in daemon:
+        report(name, f"Docker data-root must be {LXC_APPDATA}/docker")
+    if '"log-driver": "journald"' not in daemon:
+        report(name, "Docker must log to the journal, not to unbounded json-file")
+    if "docker/{{.Name}}" not in daemon:
+        report(name, "Docker journald logging must carry the container name tag")
+    if "com.docker.compose.project" not in daemon:
+        report(name, "Docker journald logging must carry the compose labels")
+
+    # data-root does not move the containerd image store, so setting only that
+    # would leave every pulled image on the container rootfs.
+    if f'root = \\"${{APPDATA_MOUNT}}/containerd\\"' not in bootstrap:
+        report(name, "the Docker LXC profile must relocate containerd's root to APPDATA")
+    if f'ls -A -- "$APPDATA_MOUNT/containerd"' not in bootstrap:
+        report(
+            name,
+            "the Docker LXC profile must confirm the running containerd populated "
+            "its APPDATA root; `containerd config dump` only parses the file and "
+            "would agree even if the live daemon still used the old root",
+        )
+    if "containerd config dump" not in body:
+        report(
+            name,
+            "the Docker LXC profile must verify containerd's resolved root "
+            "rather than trusting the edited config file",
+        )
+    if "containerd config default" not in body:
+        report(name, "the Docker LXC profile must generate containerd's config")
+
+    for unit in ("containerd.service", "docker.service"):
+        drop_in = lxc_written_file(
+            bootstrap, f"/etc/systemd/system/{unit}.d/10-kasa-appdata.conf"
+        )
+        if "ExecStartPre=/usr/local/sbin/kasa-appdata-guard" not in drop_in:
+            report(
+                name,
+                f"{unit} must refuse to start without APPDATA; otherwise Docker "
+                "silently falls back to filling the container rootfs",
+            )
+
+    if "systemctl mask docker.service docker.socket containerd.service" not in body:
+        report(
+            name,
+            "the Docker LXC profile must mask the daemons across installation so "
+            "neither starts against its default rootfs paths",
+        )
+    if "/var/lib/docker /var/lib/containerd" not in body:
+        report(name, "the Docker LXC profile must assert nothing landed on the rootfs")
+    if "docker compose version" not in body:
+        report(name, "the Docker LXC profile must verify the Compose plugin")
+    if "{{.DockerRootDir}}" not in body:
+        report(name, "the Docker LXC profile must verify Docker's actual data root")
+    if "{{.LoggingDriver}}" not in body:
+        report(name, "the Docker LXC profile must verify the active logging driver")
+
+
+def validate_lxc_idempotence(profile: Profile, bootstrap: str) -> None:
+    """A re-run must converge, not just avoid crashing.
+
+    Every unit whose configuration the bootstrap rewrites has to be restarted
+    rather than merely started, and anything masked so it cannot run during
+    installation has to actually be stopped first.
+    """
+    name = profile.name
+    body = strip_comments(bootstrap)
+
+    for unit in LXC_RECONFIGURED_UNITS:
+        if unit not in body:
+            continue
+        if f"systemctl enable --now {unit}" in body:
+            report(
+                name,
+                f"{unit}: use enable plus restart, not `enable --now`. Its "
+                "configuration is rewritten above, and start does nothing to an "
+                "already-running unit, so a re-run would leave the old one live",
+            )
+        restarted = (
+            f"systemctl restart {unit}" in body
+            or f"systemctl reload-or-restart {unit}" in body
+        )
+        if not restarted:
+            report(
+                name,
+                f"{unit}: its configuration is rewritten, so the bootstrap must "
+                "restart it for a re-run to take effect",
+            )
+
+    # mask blocks starting a unit; it does not stop one that is already running.
+    if "systemctl mask " in body and "systemctl stop" not in body:
+        report(
+            name,
+            "the LXC bootstrap masks units without stopping them; masking alone "
+            "leaves a running daemon serving the configuration being replaced",
+        )
+
+    if not profile.docker:
+        return
+
+    # On a re-run Docker's repository is already on disk, so the system upgrade
+    # can pull a new docker-ce or containerd.io. If the daemons are still up at
+    # that point, dpkg restarts them against configuration this run is about to
+    # replace -- outside the window the mask exists to create.
+    stopped = body.find("systemctl stop")
+    upgraded = body.find("apt-get dist-upgrade")
+    if stopped == -1 or upgraded == -1 or stopped > upgraded:
+        report(
+            name,
+            "the Docker daemons must be masked and stopped before the system "
+            "upgrade, not only before their configuration is rewritten; on a "
+            "re-run the upgrade can restart them behind the mask window",
+        )
+
+
+def validate_lxc_provenance(profile: Profile, bootstrap: str) -> None:
+    """Record what the build knows, and do not call any of it an image."""
+    name = profile.name
+    release_file = lxc_written_file(bootstrap, "/etc/kasa-lxc-release")
+    if not release_file:
+        report(name, "the LXC bootstrap does not write /etc/kasa-lxc-release")
+        return
+    keys = [
+        line.split("=", 1)[0]
+        for line in release_file.splitlines()
+        if "=" in line
+    ]
+    if keys != list(LXC_PROVENANCE_KEYS):
+        report(
+            name,
+            f"/etc/kasa-lxc-release keys must be {list(LXC_PROVENANCE_KEYS)}, "
+            f"found {keys}",
+        )
+    if f"ID=$PROFILE_NAME" not in release_file:
+        report(name, "/etc/kasa-lxc-release must record the profile name")
+    for forbidden in ("BUILT_AT", "TEMPLATE_VERSION", "IMAGE_BUILD"):
+        if forbidden in release_file:
+            report(
+                name,
+                f"/etc/kasa-lxc-release must not record {forbidden}: Proxmox "
+                "created this container and the bootstrap configured it, which "
+                "is not an image build",
+            )
+
+
+def validate_lxc_features(profile: Profile, command: str) -> None:
+    """The host script is where a base container could gain Docker's powers."""
+    name = profile.name
+    features = re.findall(r"--features\s+(\S+)", command)
+    granted = {token for value in features for token in value.split(",")}
+
+    if not re.search(r"--unprivileged\s+1\b", command):
+        report(name, "the LXC create script must create an unprivileged container")
+    if re.search(r"--unprivileged\s+0\b", command):
+        report(name, "the LXC create script must never create a privileged container")
+
+    if profile.docker:
+        if granted != {"keyctl=1", "nesting=1"}:
+            report(
+                name,
+                "a Docker LXC profile must grant exactly keyctl=1 and nesting=1, "
+                f"found {sorted(granted) or 'nothing'}",
+            )
+    elif features:
+        report(
+            name,
+            "a base LXC profile must pass no --features at all; every one of "
+            f"them already defaults to off, found {features}",
+        )
+
+    for token in sorted(granted):
+        if token.split("=")[0] in ("fuse", "mknod", "mount", "force_rw_sys"):
+            report(name, f"the LXC create script must not grant {token}")
+    if "unconfined" in command:
+        report(name, "the LXC create script must not weaken AppArmor confinement")
+    if re.search(r"^\s*--replace\)", command, re.MULTILINE):
+        report(name, "the LXC create script must not accept a destructive replace flag")
+    if "pct destroy" in command:
+        report(name, "the LXC create script must not destroy a container")
+    # Being active is not the same as accepting container volumes. Proxmox's
+    # default `local` carries iso,vztmpl,backup and no rootdir, so a script that
+    # checked only availability would fail later, inside pct create.
+    for variable, content, role in (
+        ("TEMPLATE_STORAGE", "vztmpl", "template"),
+        ("ROOTFS_STORAGE", "rootdir", "rootfs"),
+        ("APPDATA_STORAGE", "rootdir", "APPDATA"),
+    ):
+        if f'require_storage "${variable}" {content}' not in command:
+            report(
+                name,
+                f"the LXC create script must verify the {role} storage accepts "
+                f"{content} content before creating the container",
+            )
+
+    # pvesm exits 0 for a storage that is defined but disabled or offline, so a
+    # bare `pvesm status --storage` proves only that someone configured it once.
+    if '$3 == "active"' not in command or "print $3; exit" not in command:
+        report(
+            name,
+            "the LXC create script must require each storage to be active, not "
+            "only defined; pvesm succeeds for a disabled or offline storage",
+        )
+
+    mount_points = re.findall(r"--mp(\d+)\s", command)
+    if mount_points != ["0"]:
+        report(
+            name,
+            "the LXC create script must attach exactly one mount point, mp0; "
+            f"found {mount_points or 'none'}",
+        )
+    # The script assigns the path once and refers to it by variable, so check
+    # both halves rather than a literal that never appears on the pct line.
+    if f"APPDATA_MOUNT={LXC_APPDATA}\n" not in command:
+        report(name, f"the LXC create script must set APPDATA_MOUNT to {LXC_APPDATA}")
+    if "mp=${APPDATA_MOUNT}" not in command:
+        report(name, "the LXC mount point must be attached at APPDATA_MOUNT")
+
+
+def validate_lxc_artifact_names(release: str) -> None:
+    """Eight container filenames that cannot collide with the eight VM ones."""
+    prefix = CONFIG["NAME_PREFIX"]
+    lxc_names = [lxc_template_name(p, release, prefix) for p in PROFILES]
+    vm_names = [template_name(p, release, prefix) for p in PROFILES]
+    if len(set(lxc_names)) != len(PROFILES):
+        errors.append(f"LXC artifact names are not unique: {lxc_names}")
+    overlap = sorted(set(lxc_names) & set(vm_names))
+    if overlap:
+        errors.append(f"LXC and VM artifact names collide: {overlap}")
+
+
+def validate_generated_lxc_bundle(release: str) -> None:
+    """Run every generated container pair through build.py's own gate."""
+    for profile, container in zip(PROFILES, lxc_artifacts(
+        release, dict(STUB_PROVENANCE), TEST_SSH_PUBLIC_KEY
+    )):
+        try:
+            validate_generated_lxc(profile, container)
+        except SystemExit as error:
+            errors.append(f"{container.name}: {error}")
+
+
 def validate_no_secrets(profile: Profile, rendered: str) -> None:
     for marker in ("ssh_authorized_keys", "PRIVATE KEY", "ssh-ed25519 AAAA", "ssh-rsa AAAA"):
         if marker in rendered:
@@ -1018,9 +1729,32 @@ def main() -> int:
         validate_docker_rootless(profile, document)
         validate_no_secrets(profile, content)
 
+    containers = lxc_artifacts(
+        arguments.release, dict(STUB_PROVENANCE), TEST_SSH_PUBLIC_KEY
+    )
+    for profile, container in zip(PROFILES, containers):
+        bootstrap = container.bootstrap
+        validate_lxc_ssh(profile, bootstrap)
+        validate_lxc_sysctl(profile, bootstrap)
+        validate_lxc_packages(profile, bootstrap)
+        validate_lxc_logging(profile, bootstrap)
+        validate_lxc_var_log(profile, bootstrap)
+        validate_lxc_appdata(profile, bootstrap)
+        validate_lxc_omissions(profile, bootstrap)
+        validate_lxc_fail2ban(profile, bootstrap)
+        validate_lxc_docker(profile, bootstrap)
+        validate_lxc_idempotence(profile, bootstrap)
+        validate_lxc_provenance(profile, bootstrap)
+        validate_lxc_features(profile, container.command)
+        # The create script legitimately carries the operator's public key; the
+        # bootstrap must never carry key material at all.
+        validate_no_secrets(profile, bootstrap)
+
     validate_writer_boundary()
     validate_manifest_matches_config()
+    validate_lxc_artifact_names(arguments.release)
     validate_generated_bundle(arguments.release)
+    validate_generated_lxc_bundle(arguments.release)
 
     if arguments.full and not errors:
         run_full_checks(rendered)

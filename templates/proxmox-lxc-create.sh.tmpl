@@ -1,0 +1,242 @@
+#!/bin/bash
+# Create the KASA @@PROFILE_NAME@@ LXC container on Proxmox.
+#
+# Generated locally for one profile by tools/build.py. Copy it to a Proxmox node
+# and run it as root, with the matching bootstrap script beside it.
+#
+# This script owns only what the host owns: the container's ID, resources,
+# network, storage, SSH key, and LXC feature flags. Everything inside the
+# container is the bootstrap's job.
+set -Eeuo pipefail
+
+CTID=@@CTID@@
+HOSTNAME=@@HOSTNAME@@
+DEFAULT_CTID="$CTID"
+DEFAULT_HOSTNAME="$HOSTNAME"
+PROFILE_NAME=@@PROFILE_NAME@@
+LXC_TEMPLATE=@@LXC_TEMPLATE@@
+TEMPLATE_STORAGE=@@LXC_TEMPLATE_STORAGE@@
+ROOTFS_STORAGE=@@LXC_ROOTFS_STORAGE@@
+ROOT_DISK_SIZE=@@LXC_ROOT_DISK_SIZE@@
+APPDATA_STORAGE=@@LXC_APPDATA_STORAGE@@
+APPDATA_DISK_SIZE=@@LXC_APPDATA_DISK_SIZE@@
+APPDATA_MOUNT=@@APPDATA_MOUNT@@
+CPU=@@LXC_CPU@@
+MEMORY=@@LXC_MEMORY@@
+SWAP=@@LXC_SWAP@@
+BRIDGE=@@BRIDGE@@
+VLAN_TAG=@@LXC_VLAN_TAG@@
+NAMESERVER=@@LXC_NAMESERVER@@
+TIMEZONE=@@TIMEZONE@@
+SSH_PUBLIC_KEY=@@SSH_PUBLIC_KEY@@
+BOOTSTRAP_NAME=@@BOOTSTRAP_NAME@@
+BOOTSTRAP_SHA256=@@BOOTSTRAP_SHA256@@
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  printf '%s\n' \
+    "Usage: $0 [--ctid ID] [--hostname NAME]" \
+    '' \
+    "Creates a container for the KASA $PROFILE_NAME profile." \
+    "Defaults: --ctid $DEFAULT_CTID --hostname $DEFAULT_HOSTNAME" \
+    '' \
+    'Override both to provision more than one container from this profile.' \
+    'There is no --replace: an existing container ID is an error, and removing' \
+    'a container stays a deliberate action you take yourself.'
+}
+
+while [ "$#" -gt 0 ]; do
+  case $1 in
+    --ctid) CTID=${2:?--ctid needs a container ID}; shift 2 ;;
+    --hostname) HOSTNAME=${2:?--hostname needs a name}; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) fail "unknown argument: $1" ;;
+  esac
+done
+
+case $CTID in
+  ''|*[!0-9]*) fail "container ID must be a positive integer: $CTID" ;;
+esac
+[ "$CTID" -ge 100 ] || fail "Proxmox reserves container IDs below 100: $CTID"
+# Proxmox derives the container's hostname from this, so reject anything it
+# would turn into a different name than the one asked for.
+printf '%s' "$HOSTNAME" \
+  | grep -qE '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$' \
+  || fail "not a valid hostname: $HOSTNAME"
+
+[ "$(id -u)" -eq 0 ] || fail "run this on the Proxmox node as root"
+
+for required in awk pct pvesm pveam sha256sum ssh-keygen; do
+  command -v "$required" >/dev/null || fail "required command is missing: $required"
+done
+
+# No --replace. Destroying a container is not something a generated script
+# should be able to do by accident, and a wrong CTID here would be someone
+# else's workload.
+if pct config "$CTID" >/dev/null 2>&1; then
+  fail "container $CTID already exists; pass --ctid for a different one, or remove it yourself"
+fi
+
+# Report the storages that would work, rather than only the one that does not.
+# Only active ones: suggesting an offline target would just move the failure.
+storages_supporting() {
+  pvesm status --content "$1" 2>/dev/null \
+    | awk 'NR > 1 && $3 == "active" {print $1}' | paste -sd' ' -
+}
+
+require_storage() {
+  local storage=$1 content=$2 role=$3 status
+  pvesm status --storage "$storage" >/dev/null 2>&1 \
+    || fail "$role storage is not defined on this node: $storage"
+
+  # Defined is not the same as usable. pvesm exits 0 for a storage that is
+  # disabled or whose backing device is offline, so read the status column.
+  status=$(pvesm status --storage "$storage" 2>/dev/null | awk 'NR > 1 {print $3; exit}')
+  [ "$status" = active ] || fail "$(printf '%s\n' \
+    "$role storage '$storage' is not active (status: ${status:-unknown})." \
+    "Enable it, or bring its backing device online, before creating the container." \
+    "Active storages accepting '$content': $(storages_supporting "$content")")"
+
+  if ! pvesm status --storage "$storage" --content "$content" >/dev/null 2>&1; then
+    fail "$(printf '%s\n' \
+      "$role storage '$storage' does not accept '$content' content." \
+      "On a standard install 'local' holds only iso, vztmpl and backup, so it" \
+      "cannot hold a container rootfs or mount point volume." \
+      "Active storages on this node that accept '$content': $(storages_supporting "$content")" \
+      "Set the matching LXC_*_STORAGE in tools/.env and rebuild.")"
+  fi
+}
+
+require_storage "$TEMPLATE_STORAGE" vztmpl "template"
+require_storage "$ROOTFS_STORAGE" rootdir "rootfs"
+require_storage "$APPDATA_STORAGE" rootdir "APPDATA"
+
+# The bootstrap is optional here: it can be run later against any compatible
+# container. When it is present, verify it before it goes anywhere near the CT.
+bootstrap_path="$script_dir/$BOOTSTRAP_NAME"
+have_bootstrap=no
+if [ -f "$bootstrap_path" ]; then
+  printf '%s  %s\n' "$BOOTSTRAP_SHA256" "$bootstrap_path" | sha256sum --check - >/dev/null \
+    || fail "$BOOTSTRAP_NAME does not match the checksum recorded at build time"
+  have_bootstrap=yes
+fi
+
+ssh_key_file=$(mktemp --suffix=.pub "/root/kasa-ct-${CTID}-key.XXXXXXXX")
+chmod 0600 "$ssh_key_file"
+cleanup() { rm -f "$ssh_key_file"; }
+trap cleanup EXIT
+printf '%s\n' "$SSH_PUBLIC_KEY" >"$ssh_key_file"
+ssh-keygen -l -f "$ssh_key_file" >/dev/null \
+  || fail "the built-in SSH public key is not valid"
+
+# Proxmox verifies the appliance catalogue signature and the downloaded template
+# against it, so there is no separate checksum to carry here.
+pveam update >/dev/null
+template_volume="${TEMPLATE_STORAGE}:vztmpl/${LXC_TEMPLATE}"
+if ! pvesm list "$TEMPLATE_STORAGE" --content vztmpl | awk '{print $1}' \
+    | grep -qxF "$template_volume"; then
+  printf 'Downloading container template %s\n' "$LXC_TEMPLATE"
+  pveam download "$TEMPLATE_STORAGE" "$LXC_TEMPLATE"
+fi
+
+net0="name=eth0,bridge=${BRIDGE},firewall=1,ip=dhcp"
+if [ -n "$VLAN_TAG" ]; then
+  net0="${net0},tag=${VLAN_TAG}"
+fi
+
+# Only pass --nameserver when one is configured; with no value Proxmox inherits
+# the host's resolver, which is the right default for a DHCP container.
+optional_args=()
+if [ -n "$NAMESERVER" ]; then
+  optional_args+=(--nameserver "$NAMESERVER")
+fi
+
+printf 'Creating container %s (%s)\n' "$CTID" "$HOSTNAME"
+# APPDATA is a Proxmox-managed mount point on every profile. The container never
+# formats or identifies a block device; the host owns the volume.
+pct create "$CTID" "$template_volume" \
+  --hostname "$HOSTNAME" \
+  --ostype debian \
+  --unprivileged 1 \
+#% if docker
+  --features keyctl=1,nesting=1 \
+#% endif
+  --rootfs "${ROOTFS_STORAGE}:${ROOT_DISK_SIZE}" \
+  --mp0 "${APPDATA_STORAGE}:${APPDATA_DISK_SIZE},mp=${APPDATA_MOUNT},backup=1" \
+  --cores "$CPU" \
+  --memory "$MEMORY" \
+  --swap "$SWAP" \
+  --net0 "$net0" \
+  --timezone "$TIMEZONE" \
+  --ssh-public-keys "$ssh_key_file" \
+  --onboot 1 \
+  --start 0 \
+  "${optional_args[@]}"
+
+# --- Post-create checks ------------------------------------------------------
+# Read the properties back rather than comparing the whole features line to a
+# string: Proxmox is free to reorder or normalise it, and what matters is which
+# capabilities are on, not how the line is spelled.
+
+config=$(pct config "$CTID")
+features=$(printf '%s\n' "$config" | sed -n 's/^features: //p')
+
+has_feature() {
+  printf '%s' "$features" | tr ',' '\n' | grep -qx "$1"
+}
+
+printf '%s\n' "$config" | grep -qx 'unprivileged: 1' \
+  || fail "container $CTID is not unprivileged"
+
+for forbidden in fuse=1 mknod=1; do
+  if has_feature "$forbidden"; then
+    fail "container $CTID has $forbidden, which this profile does not use"
+  fi
+done
+if printf '%s' "$features" | tr ',' '\n' | grep -q '^mount='; then
+  fail "container $CTID may mount filesystems, which this profile does not use"
+fi
+if printf '%s\n' "$config" | grep -qi 'apparmor'; then
+  fail "container $CTID carries an AppArmor override; this profile stays confined"
+fi
+
+mp_count=$(printf '%s\n' "$config" | awk '/^mp[0-9]+:/ {n++} END {print n+0}')
+[ "$mp_count" -eq 1 ] || fail "expected exactly one mount point, found $mp_count"
+# Compare whole comma-separated options rather than matching a substring, so a
+# different mount point that merely starts with the same path cannot pass.
+mp0_options=$(printf '%s\n' "$config" | sed -n 's/^mp0: //p')
+printf '%s\n' "$mp0_options" | tr ',' '\n' | grep -qx "mp=${APPDATA_MOUNT}" \
+  || fail "mp0 is not mounted at $APPDATA_MOUNT"
+
+#% if docker
+# Docker needs exactly these two, and nothing beyond them. keyctl lets the
+# daemon use the kernel keyring from inside a user namespace; nesting exposes
+# procfs and sysfs so it can start containers of its own.
+has_feature keyctl=1 || fail "container $CTID is missing keyctl=1, which Docker needs"
+has_feature nesting=1 || fail "container $CTID is missing nesting=1, which Docker needs"
+#% endif
+
+printf 'Starting container %s\n' "$CTID"
+pct start "$CTID"
+for _ in $(seq 1 30); do
+  if [ "$(pct status "$CTID")" = "status: running" ]; then
+    break
+  fi
+  sleep 1
+done
+[ "$(pct status "$CTID")" = "status: running" ] || fail "container $CTID did not start"
+
+printf '\nCreated container %s (%s) for profile %s\n' "$CTID" "$HOSTNAME" "$PROFILE_NAME"
+
+if [ "$have_bootstrap" = yes ]; then
+  pct push "$CTID" "$bootstrap_path" "/root/$BOOTSTRAP_NAME" --perms 0755
+  printf 'Bootstrap uploaded. Complete the container with:\n\n'
+  printf '  pct exec %s -- /root/%s\n\n' "$CTID" "$BOOTSTRAP_NAME"
+else
+  printf 'Copy %s into the container and run it as root to complete setup.\n\n' \
+    "$BOOTSTRAP_NAME"
+fi
+printf 'The bootstrap creates the admin account and disables root SSH login.\n'

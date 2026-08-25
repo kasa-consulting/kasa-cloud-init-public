@@ -1,0 +1,16 @@
+# Debian LXC container template pin for this release directory.
+#
+# Unlike templates/deb13/image.yaml, this pin is maintained by hand and carries
+# no checksum. Container templates are distributed through Proxmox's own
+# appliance catalog: `pveam update` verifies the catalog signature and `pveam
+# download` verifies the template against it, so the trust path already belongs
+# to Proxmox. tools/debian_image_updater.py speaks to the versioned
+# cdimage.debian.org endpoint and has no view of that catalog, so it is
+# deliberately not extended to cover this file.
+#
+# To move the pin: run `pveam update && pveam available --section system` on a
+# Proxmox host, take the current debian-13-standard entry, and update `template`
+# here.
+
+codename: trixie
+template: debian-13-standard_13.1-2_amd64.tar.zst

@@ -1,4 +1,10 @@
-# Profile manifest. Each entry is one Proxmox template.
+# Profile manifest. Each entry is one profile, built as both a VM template and
+# an LXC container pair.
+#
+# Descriptions are implementation-neutral on purpose: they are copied verbatim
+# into each guest's provenance file, and the two families implement Docker
+# differently -- rootless on the VM, rootful inside an unprivileged container.
+# Naming one of them here would make the other's provenance wrong.
 #
 # Profiles are enumerated explicitly rather than derived as a cross-product of
 # flags, so adding a feature does not double the number of templates built.
@@ -15,7 +21,7 @@ profiles:
       - remote_syslog
 
   - name: docker
-    description: Hardened Debian agent host with rootless Docker
+    description: Hardened Debian agent host with Docker
     vmid_offset: 1
     flags:
       - docker
@@ -27,7 +33,7 @@ profiles:
     flags: []
 
   - name: docker-local
-    description: Hardened Debian agent host with rootless Docker and durable local logging
+    description: Hardened Debian agent host with Docker and durable local logging
     vmid_offset: 3
     flags:
       - docker

@@ -28,6 +28,16 @@ DEFAULT_RELEASE = "deb13"
 # Flags a template may test with `#% if <flag>`.
 KNOWN_FLAGS = frozenset({"docker", "remote_syslog"})
 
+# One LXC guest bootstrap and one Proxmox-side creation script per profile, from
+# the same profile flags the VM templates use. LXC-ness is which template gets
+# rendered, not a flag, so KNOWN_FLAGS is unchanged.
+CLOUD_CONFIG_TEMPLATE = "cloud-config.yml.tmpl"
+LXC_BOOTSTRAP_TEMPLATE = "lxc-bootstrap.sh.tmpl"
+LXC_TEMPLATE_MANIFEST = "lxc-template.yaml"
+
+# Proxmox mounts APPDATA here on every profile, VM and LXC alike.
+APPDATA_MOUNT = "/mnt/appdata"
+
 SITE_KEYS = {
     "BRIDGE",
     "SYSLOG_SERVER",
@@ -52,7 +62,33 @@ BUILD_KEYS = {
     "ROOT_DISK_SIZE",
     "APPDATA_DISK_SIZE",
 }
-CONFIG_KEYS = SITE_KEYS | BUILD_KEYS
+# LXC inputs are optional. An existing tools/.env predates them, so a missing
+# key takes the default below instead of failing the build. Unknown keys are
+# still rejected and every value is validated as strictly as a required one.
+LXC_KEY_DEFAULTS = {
+    "LXC_CTID_START": "9100",
+    "LXC_TEMPLATE_STORAGE": "local",
+    # Not "local": on a standard install that storage carries
+    # content iso,vztmpl,backup and cannot hold a container rootfs. local-lvm is
+    # Proxmox's default rootdir storage. The generated script re-checks this on
+    # the node, because no default is right for every install.
+    "LXC_ROOTFS_STORAGE": "local-lvm",
+    "LXC_APPDATA_STORAGE": "local-lvm",
+    "LXC_ROOT_DISK_SIZE": "8",
+    "LXC_APPDATA_DISK_SIZE": "16",
+    "LXC_CPU": "2",
+    "LXC_MEMORY": "2048",
+    "LXC_SWAP": "512",
+    "LXC_VLAN_TAG": "",
+    "LXC_NAMESERVER": "",
+}
+LXC_KEYS = frozenset(LXC_KEY_DEFAULTS)
+CONFIG_KEYS = SITE_KEYS | BUILD_KEYS | LXC_KEYS
+
+# An empty value means "not configured" rather than a malformed line.
+OPTIONAL_EMPTY_KEYS = frozenset(
+    {"SSH_ALLOW_USERS", "LXC_VLAN_TAG", "LXC_NAMESERVER"}
+)
 
 
 @dataclass(frozen=True)
@@ -80,11 +116,28 @@ class Image:
     sha512: str
 
 
+@dataclass(frozen=True)
+class LxcTemplate:
+    codename: str
+    template: str
+
+
 def template_name(profile: Profile, release: str, prefix: str) -> str:
     """Build the Proxmox template name from release and profile capabilities."""
     role = "docker" if profile.docker else "base"
     syslog_suffix = "-syslog" if profile.remote_syslog else ""
     return f"{prefix}-{release}-{role}{syslog_suffix}"
+
+
+def lxc_template_name(profile: Profile, release: str, prefix: str) -> str:
+    """Name the LXC artifact pair, using the VM naming convention plus `lxc`.
+
+    The `lxc` segment is what keeps these eight filenames from colliding with
+    the eight VM ones in a flat build directory.
+    """
+    role = "docker" if profile.docker else "base"
+    syslog_suffix = "-syslog" if profile.remote_syslog else ""
+    return f"{prefix}-{release}-lxc-{role}{syslog_suffix}"
 
 
 def _config_path() -> Path:
@@ -212,6 +265,43 @@ def load_image(release: str) -> Image:
     )
 
 
+def load_lxc_template(release: str) -> LxcTemplate:
+    """Read the container template pin for one release.
+
+    There is no checksum to verify here, unlike the VM image pin. Container
+    templates come from Proxmox's signed appliance catalog, so `pveam download`
+    already owns that trust path; see the manifest for the full reasoning.
+    """
+    if not re.fullmatch(r"[a-z0-9]{1,16}", release):
+        raise ValueError(f"Invalid release name: {release!r}")
+    manifest = TEMPLATES / release / LXC_TEMPLATE_MANIFEST
+    if not manifest.is_file():
+        raise ValueError(f"LXC template pin is missing: {manifest}")
+    document = yaml.safe_load(manifest.read_text(encoding="utf-8"))
+    if not isinstance(document, dict):
+        raise ValueError(f"{manifest}: expected a mapping")
+
+    missing = {"codename", "template"} - document.keys()
+    if missing:
+        raise ValueError(f"{manifest}: missing keys: {sorted(missing)}")
+    unknown = sorted(document.keys() - {"codename", "template"})
+    if unknown:
+        raise ValueError(f"{manifest}: unknown keys: {unknown}")
+
+    codename = document["codename"]
+    template = document["template"]
+    if not isinstance(codename, str) or not re.fullmatch(r"[a-z]{1,32}", codename):
+        raise ValueError(f"{manifest}: invalid codename: {codename!r}")
+    # Pin one exact appliance filename. A wildcard or a bare name would let the
+    # catalog move the container underneath a rebuild without anyone noticing.
+    if not isinstance(template, str) or not re.fullmatch(
+        r"[a-z0-9][a-z0-9._+-]{0,127}\.tar\.(zst|gz|xz)", template
+    ):
+        raise ValueError(f"{manifest}: invalid template filename: {template!r}")
+
+    return LxcTemplate(codename=codename, template=template)
+
+
 def load_config(profiles: tuple[Profile, ...]) -> dict[str, str]:
     if not CONFIG_FILE.is_file():
         raise ValueError(
@@ -234,12 +324,14 @@ def load_config(profiles: tuple[Profile, ...]) -> dict[str, str]:
         if key in values:
             raise ValueError(f"{CONFIG_FILE}:{line_number}: duplicate key {key}")
         values[key] = _parse_config_value(
-            raw_value, line_number, allow_empty=key == "SSH_ALLOW_USERS"
+            raw_value, line_number, allow_empty=key in OPTIONAL_EMPTY_KEYS
         )
 
-    missing = sorted(CONFIG_KEYS - values.keys())
+    missing = sorted(CONFIG_KEYS - LXC_KEYS - values.keys())
     if missing:
         raise ValueError(f"{CONFIG_FILE}: missing required keys: {missing}")
+    for key, default in LXC_KEY_DEFAULTS.items():
+        values.setdefault(key, default)
 
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}", values["BRIDGE"]):
         raise ValueError(f"{CONFIG_FILE}: BRIDGE contains unsupported characters")
@@ -333,6 +425,66 @@ def load_config(profiles: tuple[Profile, ...]) -> dict[str, str]:
     if int(values["MEM_MIN"]) > int(values["MEM_MAX"]):
         raise ValueError(f"{CONFIG_FILE}: MEM_MIN cannot exceed MEM_MAX")
 
+    for key in (
+        "LXC_TEMPLATE_STORAGE",
+        "LXC_ROOTFS_STORAGE",
+        "LXC_APPDATA_STORAGE",
+    ):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", values[key]):
+            raise ValueError(f"{CONFIG_FILE}: {key} contains unsupported characters")
+
+    for key in (
+        "LXC_CTID_START",
+        "LXC_ROOT_DISK_SIZE",
+        "LXC_APPDATA_DISK_SIZE",
+        "LXC_CPU",
+        "LXC_MEMORY",
+    ):
+        if not values[key].isdigit() or int(values[key]) <= 0:
+            raise ValueError(f"{CONFIG_FILE}: {key} must be a positive integer")
+    # Proxmox accepts a container with no swap, so zero is legal here.
+    if not values["LXC_SWAP"].isdigit():
+        raise ValueError(
+            f"{CONFIG_FILE}: LXC_SWAP must be a non-negative integer"
+        )
+
+    # Proxmox rejects IDs below 100 and shares one numberspace between VMs and
+    # containers, so an overlapping range would collide at create time rather
+    # than at build time, on whichever host happened to have the ID already.
+    offsets = [p.vmid_offset for p in profiles]
+    ctid_start = int(values["LXC_CTID_START"])
+    vmid_start = int(values["VMID_START"])
+    if ctid_start < 100:
+        raise ValueError(f"{CONFIG_FILE}: LXC_CTID_START must be at least 100")
+    if vmid_start < 100:
+        raise ValueError(f"{CONFIG_FILE}: VMID_START must be at least 100")
+    if ctid_start + max(offsets) > 999999999:
+        raise ValueError(
+            f"{CONFIG_FILE}: generated container IDs exceed Proxmox limits"
+        )
+    claimed_vmids = {vmid_start + offset for offset in offsets}
+    claimed_ctids = {ctid_start + offset for offset in offsets}
+    collisions = sorted(claimed_vmids & claimed_ctids)
+    if collisions:
+        raise ValueError(
+            f"{CONFIG_FILE}: LXC_CTID_START overlaps the VM ID range on {collisions}; "
+            "VM and container IDs share one Proxmox numberspace"
+        )
+
+    vlan_tag = values["LXC_VLAN_TAG"]
+    if vlan_tag and not (vlan_tag.isdigit() and 1 <= int(vlan_tag) <= 4094):
+        raise ValueError(
+            f"{CONFIG_FILE}: LXC_VLAN_TAG must be a VLAN ID between 1 and 4094"
+        )
+
+    if values["LXC_NAMESERVER"]:
+        try:
+            ipaddress.ip_address(values["LXC_NAMESERVER"])
+        except ValueError:
+            raise ValueError(
+                f"{CONFIG_FILE}: LXC_NAMESERVER is not a valid IP address"
+            ) from None
+
     return values
 
 
@@ -349,34 +501,31 @@ SITE = {key: CONFIG[key] for key in SITE_KEYS}
 SSH_ALLOW_USERS = tuple(CONFIG["SSH_ALLOW_USERS"].split())
 
 
-def render(profile: Profile, release: str = DEFAULT_RELEASE, **extra: str) -> str:
-    """Render one profile's cloud-config in memory.
+def _ssh_allow_users_directive() -> str:
+    """Render the sshd AllowUsers line, or the comment that stands in for it.
+
+    Both template families write the same sshd drop-in, and both must be safe to
+    publish: with no configured sources this is a comment, never a directive.
+    """
+    if SSH_ALLOW_USERS:
+        return "AllowUsers " + " ".join(SSH_ALLOW_USERS)
+    return "# AllowUsers source restriction is not configured"
+
+
+def expand_template(
+    template: Path, flags: dict[str, bool], replacements: dict[str, str]
+) -> str:
+    """Expand one template in memory.
+
+    Public because build.py renders the Proxmox-side LXC script through the same
+    engine: that script needs `#% if docker` so a base profile's `pct create`
+    genuinely has no --features argument, rather than one built at run time.
 
     This module never writes a file. build.py is the only artifact writer, so
     there is exactly one place that decides where generated files land.
     """
-    template = TEMPLATES / release / "cloud-config.yml.tmpl"
     if not template.is_file():
         raise ValueError(f"Template is missing: {template}")
-
-    flags = {flag: flag in profile.flags for flag in KNOWN_FLAGS}
-    replacements = {
-        "@@PROFILE_NAME@@": profile.name,
-        "@@PROFILE_DESCRIPTION@@": profile.description,
-        "@@RELEASE@@": release,
-        "@@FAIL2BAN_IGNORE_IPS@@": SITE["FAIL2BAN_IGNORE_IPS"],
-        "@@SYSLOG_SERVER@@": SITE["SYSLOG_SERVER"],
-        "@@SYSLOG_PORT@@": SITE["SYSLOG_PORT"],
-        "@@TIMEZONE@@": SITE["TIMEZONE"],
-        "@@APPDATA_WWN@@": SITE["APPDATA_WWN"],
-        "@@APPDATA_SERIAL@@": SITE["APPDATA_SERIAL"],
-        "@@SSH_ALLOW_USERS_DIRECTIVE@@": (
-            "AllowUsers " + " ".join(SSH_ALLOW_USERS)
-            if SSH_ALLOW_USERS
-            else "# AllowUsers source restriction is not configured"
-        ),
-    }
-    replacements.update({f"@@{key}@@": value for key, value in extra.items()})
 
     output: list[str] = []
     active_stack = [True]
@@ -422,3 +571,56 @@ def render(profile: Profile, release: str = DEFAULT_RELEASE, **extra: str) -> st
         compacted.append(line)
 
     return "\n".join(compacted).rstrip() + "\n"
+
+
+def profile_flags(profile: Profile) -> dict[str, bool]:
+    return {flag: flag in profile.flags for flag in KNOWN_FLAGS}
+
+
+def render(profile: Profile, release: str = DEFAULT_RELEASE, **extra: str) -> str:
+    """Render one profile's cloud-config in memory."""
+    replacements = {
+        "@@PROFILE_NAME@@": profile.name,
+        "@@PROFILE_DESCRIPTION@@": profile.description,
+        "@@RELEASE@@": release,
+        "@@FAIL2BAN_IGNORE_IPS@@": SITE["FAIL2BAN_IGNORE_IPS"],
+        "@@SYSLOG_SERVER@@": SITE["SYSLOG_SERVER"],
+        "@@SYSLOG_PORT@@": SITE["SYSLOG_PORT"],
+        "@@TIMEZONE@@": SITE["TIMEZONE"],
+        "@@APPDATA_WWN@@": SITE["APPDATA_WWN"],
+        "@@APPDATA_SERIAL@@": SITE["APPDATA_SERIAL"],
+        "@@SSH_ALLOW_USERS_DIRECTIVE@@": _ssh_allow_users_directive(),
+    }
+    replacements.update({f"@@{key}@@": value for key, value in extra.items()})
+    return expand_template(
+        TEMPLATES / release / CLOUD_CONFIG_TEMPLATE,
+        profile_flags(profile),
+        replacements,
+    )
+
+
+def render_lxc(profile: Profile, release: str = DEFAULT_RELEASE, **extra: str) -> str:
+    """Render one profile's LXC guest bootstrap in memory.
+
+    APPDATA_WWN and APPDATA_SERIAL are deliberately absent. A container never
+    sees a raw device, so a bootstrap that referenced them would be describing a
+    disk it cannot reach; leaving them out means such a template fails to render
+    rather than emitting a check that can never pass.
+    """
+    replacements = {
+        "@@PROFILE_NAME@@": profile.name,
+        "@@PROFILE_DESCRIPTION@@": profile.description,
+        "@@RELEASE@@": release,
+        "@@FAIL2BAN_IGNORE_IPS@@": SITE["FAIL2BAN_IGNORE_IPS"],
+        "@@SYSLOG_SERVER@@": SITE["SYSLOG_SERVER"],
+        "@@SYSLOG_PORT@@": SITE["SYSLOG_PORT"],
+        "@@TIMEZONE@@": SITE["TIMEZONE"],
+        "@@APPDATA_MOUNT@@": APPDATA_MOUNT,
+        "@@SSH_ALLOW_USERS_DIRECTIVE@@": _ssh_allow_users_directive(),
+    }
+    replacements.update({f"@@{key}@@": value for key, value in extra.items()})
+    return expand_template(
+        TEMPLATES / release / LXC_BOOTSTRAP_TEMPLATE,
+        profile_flags(profile),
+        replacements,
+    )

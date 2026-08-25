@@ -4,3 +4,4 @@ tools/.env
 __pycache__/
 .env
 id_ed25519*
+keys.pub

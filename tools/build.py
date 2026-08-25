@@ -18,6 +18,7 @@ import sys
 import tempfile
 
 from render import (
+    APPDATA_MOUNT,
     CONFIG,
     CONFIG_FILE,
     DEFAULT_RELEASE,
@@ -27,14 +28,21 @@ from render import (
     ROOT,
     SSH_ALLOW_USERS,
     Image,
+    LxcTemplate,
     Profile,
+    expand_template,
     load_image,
+    load_lxc_template,
+    lxc_template_name,
+    profile_flags,
     render,
+    render_lxc,
     template_name,
 )
 
 
 COMMAND_TEMPLATE = ROOT / "templates" / "proxmox-create.sh.tmpl"
+LXC_COMMAND_TEMPLATE = ROOT / "templates" / "proxmox-lxc-create.sh.tmpl"
 BUNDLE_MARKER = ".kasa-cloud-init-bundle"
 
 @dataclass(frozen=True)
@@ -44,6 +52,22 @@ class VendorArtifact:
     filename: str
     digest: str
     content: str
+
+
+@dataclass(frozen=True)
+class LxcArtifact:
+    """One profile's container pair: what the host runs, and what the guest runs.
+
+    The guest bootstrap is deliberately usable on its own against an already
+    created container, so the two are separate files rather than one script.
+    """
+
+    ctid: int
+    name: str
+    bootstrap_filename: str
+    command_filename: str
+    bootstrap: str
+    command: str
 
 
 def fail(message: str) -> None:
@@ -141,6 +165,110 @@ def render_command(
     if unresolved:
         fail(f"unresolved Proxmox command markers: {unresolved}")
     return content
+
+
+def render_lxc_command(
+    *,
+    profile: Profile,
+    ctid: int,
+    name: str,
+    pin: LxcTemplate,
+    bootstrap_filename: str,
+    bootstrap_digest: str,
+    public_key: str,
+) -> str:
+    values = {
+        "CTID": str(ctid),
+        "HOSTNAME": name,
+        "PROFILE_NAME": profile.name,
+        "LXC_TEMPLATE": pin.template,
+        "LXC_TEMPLATE_STORAGE": CONFIG["LXC_TEMPLATE_STORAGE"],
+        "LXC_ROOTFS_STORAGE": CONFIG["LXC_ROOTFS_STORAGE"],
+        "LXC_ROOT_DISK_SIZE": CONFIG["LXC_ROOT_DISK_SIZE"],
+        "LXC_APPDATA_STORAGE": CONFIG["LXC_APPDATA_STORAGE"],
+        "LXC_APPDATA_DISK_SIZE": CONFIG["LXC_APPDATA_DISK_SIZE"],
+        "APPDATA_MOUNT": APPDATA_MOUNT,
+        "LXC_CPU": CONFIG["LXC_CPU"],
+        "LXC_MEMORY": CONFIG["LXC_MEMORY"],
+        "LXC_SWAP": CONFIG["LXC_SWAP"],
+        "BRIDGE": CONFIG["BRIDGE"],
+        "LXC_VLAN_TAG": CONFIG["LXC_VLAN_TAG"],
+        "LXC_NAMESERVER": CONFIG["LXC_NAMESERVER"],
+        "TIMEZONE": CONFIG["TIMEZONE"],
+        "SSH_PUBLIC_KEY": public_key,
+        "BOOTSTRAP_NAME": bootstrap_filename,
+        "BOOTSTRAP_SHA256": bootstrap_digest,
+    }
+    replacements = {
+        f"@@{key}@@": shlex.quote(value) for key, value in values.items()
+    }
+    return expand_template(
+        LXC_COMMAND_TEMPLATE, profile_flags(profile), replacements
+    )
+
+
+def validate_generated_lxc(profile: Profile, artifact: LxcArtifact) -> None:
+    """Check the container pair before either file reaches the output directory.
+
+    The separation these assertions defend is the whole point of having four
+    profiles: a base container that quietly gained Docker's feature set would
+    still work, which is exactly why nothing downstream would notice.
+    """
+    command = artifact.command
+    name = artifact.command_filename
+
+    # Read the options the script actually passes to pct. Scanning the whole
+    # file would trip over the script's own post-create assertions, which name
+    # the very features they exist to reject.
+    features = re.findall(r"--features\s+(\S+)", command)
+    granted = {token for value in features for token in value.split(",")}
+
+    if not re.search(r"--unprivileged\s+1\b", command):
+        fail(f"{name}: container must be created unprivileged")
+    if re.search(r"--unprivileged\s+0\b", command):
+        fail(f"{name}: container must never be created privileged")
+
+    if profile.docker:
+        if granted != {"keyctl=1", "nesting=1"}:
+            fail(
+                f"{name}: a Docker profile must grant exactly keyctl=1 and "
+                f"nesting=1, found {sorted(granted) or 'nothing'}"
+            )
+    elif features:
+        fail(
+            f"{name}: a base profile must pass no --features at all; Proxmox "
+            f"already defaults every one of them to off, found {features}"
+        )
+
+    for token in sorted(granted):
+        if token.split("=")[0] in ("fuse", "mknod", "mount", "force_rw_sys"):
+            fail(f"{name}: must not grant {token}")
+    if "unconfined" in command:
+        fail(f"{name}: must not weaken the container's AppArmor profile")
+    # Look for the capability, not the word: the script explains in prose that
+    # it has no replace path, and that sentence must not trip this check.
+    if re.search(r"^\s*--replace\)", command, re.MULTILINE):
+        fail(f"{name}: must not accept a replace flag that destroys a container")
+    if "pct destroy" in command:
+        fail(f"{name}: must not destroy a container")
+    mount_points = re.findall(r"--mp(\d+)\s", command)
+    if mount_points != ["0"]:
+        fail(
+            f"{name}: must attach exactly one mount point, mp0; "
+            f"found {mount_points or 'none'}"
+        )
+
+    shellcheck = shutil.which("shellcheck")
+    for filename, content in (
+        (artifact.bootstrap_filename, artifact.bootstrap),
+        (artifact.command_filename, command),
+    ):
+        try:
+            run(["bash", "-n"], input_text=content)
+        except SystemExit:
+            fail(f"{filename}: generated script is not valid bash")
+        if shellcheck:
+            run([shellcheck, "--shell", "bash", "-"], input_text=content)
 
 
 def validate_generated_command(vendor: VendorArtifact, command: str) -> None:
@@ -267,6 +395,53 @@ def build_vendor(profile: Profile, release: str, provenance: dict[str, str]) -> 
     )
 
 
+def build_lxc_bootstrap(
+    profile: Profile, release: str, provenance: dict[str, str], pin: LxcTemplate
+) -> str:
+    # RENDERED_AT, not BUILT_AT: this bootstraps a container Proxmox already
+    # created, and calling that a build would overstate what happened.
+    return render_lxc(
+        profile,
+        release,
+        LXC_TEMPLATE=pin.template,
+        SOURCE_COMMIT=provenance["SOURCE_COMMIT"],
+        SOURCE_TREE_DIRTY=provenance["SOURCE_TREE_DIRTY"],
+        RENDERED_AT=provenance["BUILT_AT"],
+    )
+
+
+def lxc_artifacts(
+    release: str, provenance: dict[str, str], public_key: str
+) -> tuple[LxcArtifact, ...]:
+    pin = load_lxc_template(release)
+    ctid_start = int(CONFIG["LXC_CTID_START"])
+    prefix = CONFIG["NAME_PREFIX"]
+    artifacts: list[LxcArtifact] = []
+    for profile in PROFILES:
+        bootstrap = build_lxc_bootstrap(profile, release, provenance, pin)
+        name = lxc_template_name(profile, release, prefix)
+        bootstrap_filename = f"{name}-bootstrap.sh"
+        artifacts.append(
+            LxcArtifact(
+                ctid=ctid_start + profile.vmid_offset,
+                name=name,
+                bootstrap_filename=bootstrap_filename,
+                command_filename=f"create-{name}.sh",
+                bootstrap=bootstrap,
+                command=render_lxc_command(
+                    profile=profile,
+                    ctid=ctid_start + profile.vmid_offset,
+                    name=name,
+                    pin=pin,
+                    bootstrap_filename=bootstrap_filename,
+                    bootstrap_digest=sha256(bootstrap),
+                    public_key=public_key,
+                ),
+            )
+        )
+    return tuple(artifacts)
+
+
 def vendor_artifacts(release: str, provenance: dict[str, str]) -> tuple[VendorArtifact, ...]:
     vmid_start = int(CONFIG["VMID_START"])
     prefix = CONFIG["NAME_PREFIX"]
@@ -319,6 +494,10 @@ def build(release: str) -> None:
     for _, command, vendor in commands:
         validate_generated_command(vendor, command)
 
+    containers = lxc_artifacts(release, provenance, public_key)
+    for profile, container in zip(PROFILES, containers):
+        validate_generated_lxc(profile, container)
+
     output_directory = prepare_output_directory()
 
     yaml_mode = stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH
@@ -339,6 +518,23 @@ def build(release: str) -> None:
         install_artifact(output_directory, name, command, command_mode)
         for name, command, _ in commands
     )
+    lxc_paths = [
+        install_artifact(
+            output_directory,
+            container.bootstrap_filename,
+            container.bootstrap,
+            command_mode,
+        )
+        for container in containers
+    ] + [
+        install_artifact(
+            output_directory,
+            container.command_filename,
+            container.command,
+            command_mode,
+        )
+        for container in containers
+    ]
 
     print(f"Built template bundle for {release} ({image.name})")
     for path in paths:
@@ -350,6 +546,20 @@ def build(release: str) -> None:
     for command_name, _, _ in commands:
         print(f"  bash {command_name}")
     print("Add --replace to rebuild over an existing template.")
+
+    print(f"\nBuilt LXC bundle for {release} ({load_lxc_template(release).template})")
+    for path in lxc_paths:
+        print(path)
+    print(
+        "Copy each create script and its matching bootstrap to a Proxmox node, "
+        "keeping the pair in the same directory, then run any one of these:"
+    )
+    for container in containers:
+        print(f"  bash {container.command_filename}   # container {container.ctid}")
+    print(
+        "Each script creates and starts its container, then prints the pct exec "
+        "command that completes it."
+    )
 
 
 def main() -> int:
