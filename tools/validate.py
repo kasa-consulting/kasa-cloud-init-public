@@ -1184,22 +1184,29 @@ def validate_lxc_ssh(profile: Profile, bootstrap: str) -> None:
     for earlier, later, message in (
         (
             "install -m 0600 -o admin -g admin",
-            "systemctl reload-or-restart ssh.service",
-            "admin's key must be installed before sshd is reloaded",
+            "systemctl restart ssh.service",
+            "admin's key must be installed before sshd is restarted",
         ),
         (
             "visudo -cf /etc/sudoers.d/90-admin",
-            "systemctl reload-or-restart ssh.service",
-            "sudo must be validated before sshd is reloaded",
+            "systemctl restart ssh.service",
+            "sudo must be validated before sshd is restarted",
         ),
         (
             "/usr/sbin/sshd -t",
-            "systemctl reload-or-restart ssh.service",
-            "sshd -t must run before sshd is reloaded",
+            "systemctl restart ssh.service",
+            "sshd -t must run before sshd is restarted",
         ),
     ):
         if earlier in body and later in body and body.index(earlier) > body.index(later):
             report(name, f"LXC bootstrap ordering: {message}")
+
+    if "systemctl disable --now ssh.socket" not in body:
+        report(
+            name,
+            "the LXC bootstrap must disable ssh.socket before restarting "
+            "ssh.service so systemd and sshd do not both own port 22",
+        )
 
 
 def validate_lxc_sysctl(profile: Profile, bootstrap: str) -> None:

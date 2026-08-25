@@ -598,7 +598,7 @@ Provenance lands in `/etc/kasa-lxc-release`:
 ID=docker
 DESCRIPTION=Hardened Debian agent host with Docker
 RELEASE=deb13
-EXPECTED_LXC_TEMPLATE=debian-13-standard_13.1-2_amd64.tar.zst
+EXPECTED_LXC_TEMPLATE=debian-13-standard_13.6-1_amd64.tar.zst
 DOCKER=yes
 LOGGING=remote
 SOURCE_COMMIT=<commit this was rendered from>

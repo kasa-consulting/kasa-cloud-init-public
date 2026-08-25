@@ -243,6 +243,11 @@ APT::Periodic::AutocleanInterval "7";
 EOF
 
 export DEBIAN_FRONTEND=noninteractive
+# pct exec inherits the caller's locale, but the minimal Debian appliance does
+# not necessarily generate it. C.UTF-8 is built into Debian's libc and keeps
+# package scripts deterministic without installing the locales package.
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
 
 log "Updating package lists"
 apt-get update
@@ -472,8 +477,12 @@ ssh-keygen -l -f /etc/ssh/kasa_user_ca.pub >/dev/null \
 
 install -d -m 0755 /run/sshd
 /usr/sbin/sshd -t || fail "the new sshd configuration is invalid; root access is unchanged"
+# Debian's appliance enables socket activation as well as ssh.service. A HUP
+# makes sshd reopen port 22 while systemd still owns the socket, and the daemon
+# exits with "Cannot bind any address". Keep one owner for the port.
+systemctl disable --now ssh.socket
 systemctl enable ssh.service
-systemctl reload-or-restart ssh.service
+systemctl restart ssh.service
 systemctl is-active --quiet ssh.service || fail "ssh.service is not running"
 
 # Read the policy back from sshd itself rather than trusting the file we wrote.
@@ -759,6 +768,10 @@ EOF
 log "Verifying the bootstrapped container"
 
 systemctl is-enabled --quiet ssh.service || fail "ssh.service is not enabled at boot"
+systemctl is-enabled --quiet ssh.socket \
+  && fail "ssh.socket is enabled alongside ssh.service"
+systemctl is-active --quiet ssh.socket \
+  && fail "ssh.socket is still active alongside ssh.service"
 systemctl is-enabled --quiet fail2ban.service || fail "fail2ban.service is not enabled at boot"
 systemctl is-enabled --quiet rsyslog.service || fail "rsyslog.service is not enabled at boot"
 systemctl enable kasa-appdata-guard.service >/dev/null
