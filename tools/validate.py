@@ -25,6 +25,7 @@ from build import (
     validate_generated_lxc,
     vendor_artifacts,
 )
+import render as render_module
 from render import (
     CONFIG,
     DEFAULT_RELEASE,

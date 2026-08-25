@@ -666,14 +666,20 @@ def expand_template(
         # A multi-line value -- an armoured GPG key, a PEM certificate, a list of SSH
         # public keys -- has to be re-indented onto every line it produces, or it lands
         # unindented inside a YAML block scalar and the document silently changes shape.
-        # The text before the placeholder is the indent, which is why these are matched
-        # before the ordinary substitutions run and why such a placeholder must sit alone
-        # on its line.
+        #
+        # Only when the text before the placeholder is *indentation*. That text is repeated
+        # on every line, so for `SSH_PUBLIC_KEY=@@SSH_PUBLIC_KEY@@` in a shell script it
+        # would prefix each key after the first with a literal `SSH_PUBLIC_KEY=`, producing
+        # a file bash still parses and Proxmox then rejects one key at a time. A shell
+        # assignment wants the value substituted whole; shlex.quote has already made it a
+        # single valid multi-line literal.
         block = next(
             (
                 (placeholder, value)
                 for placeholder, value in replacements.items()
-                if "\n" in value and placeholder in line
+                if "\n" in value
+                and placeholder in line
+                and not line[: line.index(placeholder)].strip()
             ),
             None,
         )

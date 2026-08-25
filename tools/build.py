@@ -223,6 +223,7 @@ def validate_generated_lxc(profile: Profile, artifact: LxcArtifact) -> None:
     """
     command = artifact.command
     name = artifact.command_filename
+    validate_injected_keys(f"{artifact.name} create script", artifact.command)
 
     # Read the options the script actually passes to pct. Scanning the whole
     # file would trip over the script's own post-create assertions, which name
@@ -278,6 +279,43 @@ def validate_generated_lxc(profile: Profile, artifact: LxcArtifact) -> None:
             run([shellcheck, "--shell", "bash", "-"], input_text=content)
 
 
+def validate_injected_keys(label: str, script: str) -> None:
+    """Validate every injected key the way Proxmox validates it: one line at a time.
+
+    Proxmox's `--sshkeys` runs `ssh-keygen -l` per line and dies with "SSH public key
+    validation error" if any line fails. Counting `ssh-ed25519` occurrences does not catch
+    a mangled line, and neither does `bash -n` or shellcheck -- a shell assignment holding
+    corrupted keys is still valid shell. Only per-line validation catches it, which is why
+    this exists rather than a substring check.
+    """
+    match = re.search(r"^SSH_PUBLIC_KEY='([^']*)'", script, re.MULTILINE | re.DOTALL)
+    if match is None:
+        # A certificate-only build injects no key and omits the assignment entirely.
+        if "--sshkeys" in script or "--ssh-public-keys" in script:
+            fail(f"{label}: passes an SSH key argument without defining SSH_PUBLIC_KEY")
+        return
+
+    lines = match.group(1).splitlines()
+    if not lines:
+        fail(f"{label}: SSH_PUBLIC_KEY is empty")
+    with tempfile.TemporaryDirectory(prefix="kasa-key-check.") as temp_dir:
+        for number, line in enumerate(lines, start=1):
+            key_file = Path(temp_dir) / f"key{number}.pub"
+            key_file.write_text(line + "\n", encoding="utf-8")
+            result = subprocess.run(
+                ["ssh-keygen", "-l", "-f", str(key_file)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                fail(
+                    f"{label}: injected key on line {number} is not a valid public key: "
+                    f"{line[:60]!r}. Proxmox validates each line separately and would "
+                    "refuse this with 'SSH public key validation error'."
+                )
+
+
 def validate_generated_command(vendor: VendorArtifact, command: str) -> None:
     appdata_volume = (
         "${VM_STORAGE_NAME}:${APPDATA_DISK_SIZE},"
@@ -301,6 +339,8 @@ def validate_generated_command(vendor: VendorArtifact, command: str) -> None:
         fail("generated Proxmox command must not tell the operator the VM powers off")
     if "the VM remains running afterward" not in command:
         fail("generated Proxmox command must describe first-boot running state")
+
+    validate_injected_keys(f"{vendor.template_name} create script", command)
 
     cloud_init = shutil.which("cloud-init")
     if cloud_init:
