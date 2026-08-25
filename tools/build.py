@@ -37,6 +37,7 @@ from render import (
     profile_flags,
     render,
     render_lxc,
+    resolve_config_path,
     template_name,
 )
 
@@ -133,10 +134,18 @@ def source_provenance() -> dict[str, str]:
 
 def render_command(
     *,
+    profile: Profile,
     vendor: VendorArtifact,
     image: Image,
     public_key: str,
 ) -> str:
+    """Render one VM's Proxmox creation script.
+
+    Goes through expand_template rather than plain substitution so the script can carry
+    `#% if ssh_user_ca`: a CA-only template must not pass --sshkeys, and must not assert
+    that Proxmox generated authorized keys it was never given. This is the same path
+    render_lxc_command already uses.
+    """
     replacements = {
         "@@VMID@@": str(vendor.vmid),
         "@@NAME@@": vendor.template_name,
@@ -158,13 +167,11 @@ def render_command(
         "@@IMAGE_SHA512@@": image.sha512,
         "@@IMAGE_URL@@": image.url,
     }
-    content = COMMAND_TEMPLATE.read_text(encoding="utf-8")
-    for marker, value in replacements.items():
-        content = content.replace(marker, shlex.quote(value))
-    unresolved = sorted(set(re.findall(r"@@[A-Z0-9_]+@@", content)))
-    if unresolved:
-        fail(f"unresolved Proxmox command markers: {unresolved}")
-    return content
+    quoted = {marker: shlex.quote(value) for marker, value in replacements.items()}
+    try:
+        return expand_template(COMMAND_TEMPLATE, profile_flags(profile), quoted)
+    except ValueError as error:
+        fail(f"Proxmox command template: {error}")
 
 
 def render_lxc_command(
@@ -370,19 +377,75 @@ def prepare_output_directory() -> Path:
     return directory
 
 
-def read_public_key() -> str:
-    key_path = Path(CONFIG["SSH_PUBLIC_KEY_FILE"]).expanduser()
-    if not key_path.is_absolute():
-        key_path = CONFIG_FILE.parent / key_path
+def read_public_keys() -> str:
+    """Read every SSH public key to inject, newline-separated, or "" when unconfigured.
+
+    Multiple keys are supported because a fleet has more than one operator and more than
+    one control host: tools/keys.pub carries a workstation key and the controller's. Both
+    `qm set --sshkeys` and `pct create --ssh-public-keys` read one key per line, and the
+    generated scripts already write the value with `printf '%s\\n'`, so nothing on the
+    Proxmox side has to know how many there are.
+
+    Empty is legitimate when SSH_USER_CA_PUBLIC_KEY is set -- a CA-only template. render.py
+    refuses the both-empty case, so reaching here with no keys and no CA is impossible.
+    """
+    configured = CONFIG["SSH_PUBLIC_KEY_FILE"]
+    if not configured:
+        return ""
+    key_path = resolve_config_path(configured)
     if not key_path.is_file():
-        fail(f"SSH public key is missing: {key_path}")
-    lines = key_path.read_text(encoding="utf-8").splitlines()
-    if len(lines) != 1 or not lines[0]:
-        fail("SSH_PUBLIC_KEY_FILE must contain exactly one public key line")
+        # Name the resolved path and what it was resolved against. A relative value is
+        # resolved against tools/, not the repository root, so `./tools/keys.pub` becomes
+        # tools/tools/keys.pub -- and the configured string alone makes that look correct.
+        fail(
+            f"SSH public key file is missing: {key_path} "
+            f"(SSH_PUBLIC_KEY_FILE={configured!r}, resolved against {CONFIG_FILE.parent})"
+        )
+
+    keys = [
+        line.strip()
+        for line in key_path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if not keys:
+        fail(f"{key_path} contains no public keys")
+
+    # One call reports every key in the file, so this validates all of them.
     run(["ssh-keygen", "-l", "-f", str(key_path)])
-    if "-cert-v01@openssh.com " in lines[0]:
-        fail("signed OpenSSH certificates require trusted-CA server configuration")
-    return lines[0]
+
+    for key in keys:
+        if "-cert-v01@openssh.com " in key:
+            fail(
+                f"{key_path} contains a signed OpenSSH certificate. A certificate cannot "
+                "be an authorized key. To have hosts accept certificates, set "
+                "SSH_USER_CA_PUBLIC_KEY to the CA public key instead."
+            )
+    if len(keys) != len(set(keys)):
+        fail(f"{key_path} contains duplicate public keys")
+    return "\n".join(keys)
+
+
+def verify_root_ca() -> None:
+    """Parse the configured root CA and refuse one that has already expired.
+
+    render.py has already checked the file is a single certificate with no private key.
+    This is the part that needs openssl: a structurally valid but expired anchor would be
+    baked into an image that outlives the build, and update-ca-certificates installs it
+    without complaint.
+    """
+    configured = CONFIG["KASA_ROOT_CA_FILE"]
+    if not configured:
+        return
+    ca_path = resolve_config_path(configured)
+    run(["openssl", "x509", "-noout", "-in", str(ca_path)])
+    result = subprocess.run(
+        ["openssl", "x509", "-noout", "-checkend", "0", "-in", str(ca_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        fail(f"{ca_path}: the root CA certificate has expired")
 
 
 def build_vendor(profile: Profile, release: str, provenance: dict[str, str]) -> str:
@@ -466,14 +529,18 @@ def build(release: str) -> None:
         fail("copy tools/env.example to tools/.env and edit it first")
     if PRIVATE_SOURCE_MARKER.is_file() and not SSH_ALLOW_USERS:
         fail("private source builds require SSH_ALLOW_USERS in tools/.env")
-    for command in ("bash", "ssh-keygen"):
+    required = ["bash", "ssh-keygen"]
+    if CONFIG["KASA_ROOT_CA_FILE"]:
+        required.append("openssl")
+    for command in required:
         if not shutil.which(command):
             fail(f"required local command is missing: {command}")
 
     run([sys.executable, str(ROOT / "tools" / "validate.py")])
 
     image = load_image(release)
-    public_key = read_public_key()
+    public_key = read_public_keys()
+    verify_root_ca()
     provenance = source_provenance()
     if provenance["SOURCE_TREE_DIRTY"] == "true":
         print(
@@ -486,10 +553,12 @@ def build(release: str) -> None:
     commands = tuple(
         (
             f"create-{vendor.template_name}.sh",
-            render_command(vendor=vendor, image=image, public_key=public_key),
+            render_command(
+                profile=profile, vendor=vendor, image=image, public_key=public_key
+            ),
             vendor,
         )
-        for vendor in vendors
+        for profile, vendor in zip(PROFILES, vendors)
     )
     for _, command, vendor in commands:
         validate_generated_command(vendor, command)

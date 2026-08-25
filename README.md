@@ -166,6 +166,40 @@ update and upgrade before anything else is configured.
 There are no language runtimes, build tools, or agent software. This is a base
 image; agent payloads layer on top of a clone.
 
+### Trust anchors
+
+Two optional inputs let a host trust your own certificate authorities from its
+first boot, instead of after a configuration run that has to reach the host
+first — which is the awkward part, because reaching it is what you were trying
+to arrange.
+
+Both are public material. Neither is a credential, and nothing secret belongs in
+a cloud-init payload: the vendor-data snippet is shared by every clone of a
+template, and the rendered config stays readable on the guest afterwards. Leave
+either unset and it renders away completely.
+
+| `tools/.env` key | Effect in the guest |
+| --- | --- |
+| `SSH_USER_CA_PUBLIC_KEY` | Writes the CA public key to `/etc/ssh/kasa_user_ca.pub` and one `TrustedUserCAKeys` directive to `/etc/ssh/sshd_config.d/60-kasa-user-ca.conf`. The host then accepts short-lived SSH user certificates signed by that CA. |
+| `KASA_ROOT_CA_FILE` | Adds one PEM certificate to the system trust store through cloud-init's `ca_certs` module, so the guest can validate certificates issued by your internal PKI. |
+
+`60-` rather than `99-`: OpenSSH takes the first value it sees for most
+keywords, and `99-harden.conf` owns `AllowUsers` and `AuthenticationMethods`.
+The CA drop-in carries exactly one directive so it cannot shadow them.
+
+**An SSH certificate does not bypass `AllowUsers`.** If you set a source
+allowlist, a valid certificate from an address outside it is still refused —
+which looks exactly like a broken CA. Check the allowlist first.
+
+First boot requires **at least one** way to authenticate: an injected public key,
+a trusted user CA, or both. With neither, the boot fails deliberately rather than
+producing a VM nobody can enter. Both is the ordinary case and the safest one,
+since the injected key is break-glass for a certificate outage.
+
+Host key verification is a separate problem and this does not solve it. These are
+user certificates; the first connection to a new host still has to accept its
+host key.
+
 The docker profile adds `docker-ce`, `docker-ce-cli`, `containerd.io`,
 `docker-buildx-plugin`, `docker-compose-plugin`, `docker-ce-rootless-extras`
 from `download.docker.com` (key pinned to fingerprint

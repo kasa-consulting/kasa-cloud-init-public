@@ -12,6 +12,23 @@ timezone: @@TIMEZONE@@
 ssh_pwauth: false
 disable_root: true
 
+#% if kasa_root_ca
+# The KASA internal root CA, so this guest can validate certificates issued by the
+# internal PKI without per-service configuration. Public material: the private half is
+# generated inside OpenBao and never leaves it.
+#
+# cloud-init's own module rather than a write_files plus update-ca-certificates in
+# cloud-init-finalize: it runs in cloud_init_modules, well before the package and runcmd
+# stages, so anything later in this same boot already sees the anchor.
+#
+# remove_defaults is deliberately absent. Setting it drops Debian's CA bundle, which
+# breaks apt over HTTPS and every fetch in the rest of this boot.
+ca_certs:
+  trusted:
+    - |
+      @@KASA_ROOT_CA_PEM@@
+#% endif
+
 # The cloud-init mounts module is the sole owner of this mount. bootcmd only
 # validates or creates the filesystem so the same target cannot be mounted twice.
 # Deliberately not nosuid: container image layers legitimately ship setuid
@@ -125,6 +142,45 @@ write_files:
       LoginGraceTime 30s
       MaxSessions 5
       MaxStartups 10:30:100
+
+#% if ssh_user_ca
+  # Trust for the KASA SSH user CA, so a host is reachable with a short-lived
+  # certificate from its first boot instead of after a configuration run that has to
+  # reach it first. The CA public key is not secret and is distributed on purpose; the
+  # signing key is generated inside OpenBao and never leaves it.
+  #
+  # These two paths and this file's contents must stay identical to
+  # kasa-ansible/roles/kasa_ssh_ca, which writes the same files on the same hosts. A
+  # difference makes that role rewrite them and reload sshd on every new host.
+  #
+  # 60- rather than 99-: 99-harden.conf above is this template's, and OpenSSH takes the
+  # first value it sees for most keywords. Nothing here overlaps it, and the numeric gap
+  # keeps the ownership boundary obvious.
+  - path: /etc/ssh/kasa_user_ca.pub
+    owner: root:root
+    permissions: "0644"
+    content: |
+      @@SSH_USER_CA_PUBLIC_KEY@@
+
+  # Exactly one directive. AllowUsers, AuthenticationMethods and the rest of the
+  # hardening belong to 99-harden.conf, whose source of truth is SSH_ALLOW_USERS in
+  # tools/.env. Emitting any of them here would fork that.
+  - path: /etc/ssh/sshd_config.d/60-kasa-user-ca.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      # KASA SSH user CA trust. Written by kasa-cloud-init at first boot and converged by
+      # kasa-ansible roles/kasa_ssh_ca. Do not edit on the host.
+      #
+      # Two owners, one byte-identical file, deliberately: a host built from a CA-configured
+      # template already has this, and any difference here would make the role rewrite it and
+      # reload sshd on every new host. Change one and change the other.
+      #
+      # This file carries one directive. AllowUsers, AuthenticationMethods and the rest of
+      # the hardening live in 99-harden.conf, whose source of truth is SSH_ALLOW_USERS in
+      # kasa-cloud-init/tools/.env. Emitting any of them here would fork that.
+      TrustedUserCAKeys /etc/ssh/kasa_user_ca.pub
+#% endif
 
   # Do not add a user namespace restriction here (user.max_user_namespaces=0 or
   # kernel.apparmor_restrict_unprivileged_userns=1). Debian 13 leaves
@@ -745,14 +801,46 @@ write_files:
       chown -R admin:admin /home/admin
       chmod 0700 /home/admin
 
-      if [ ! -s /home/admin/.ssh/authorized_keys ]; then
-        echo "No SSH key was supplied for admin through Proxmox cloud-init data" >&2
+      # Reachability gate. A host needs at least one way to authenticate an operator,
+      # or this boot has produced a VM nobody can enter -- so failing here is the point,
+      # not a nuisance. Either anchor alone is sufficient. Both is the normal case and
+      # the safest one: the injected key is break-glass for a certificate outage.
+      install -d -m 0755 /run/sshd
+
+      # Config test first, so a syntax error is reported as a syntax error. The effective
+      # check below reads the same configuration, and running it first would report a
+      # broken sshd_config as a missing CA trust.
+      /usr/sbin/sshd -t
+
+      ssh_anchor=""
+
+      if [ -s /home/admin/.ssh/authorized_keys ]; then
+        ssh-keygen -l -f /home/admin/.ssh/authorized_keys >/dev/null
+        ssh_anchor="authorized_keys"
+      fi
+#% if ssh_user_ca
+      # ssh-keygen -l is not redundant with sshd -t. sshd -t exits 0 against a
+      # TrustedUserCAKeys naming a file that is missing or truncated -- it never reads
+      # the key at config-test time -- so this is the only check that catches a
+      # malformed CA key. sshd -T is then the only thing that proves the drop-in was
+      # included rather than written and silently ignored.
+      ssh-keygen -l -f /etc/ssh/kasa_user_ca.pub >/dev/null
+      if /usr/sbin/sshd -T 2>/dev/null |
+        grep -qi '^trustedusercakeys /etc/ssh/kasa_user_ca\.pub$'; then
+        ssh_anchor="${ssh_anchor:+$ssh_anchor and }SSH user CA"
+      else
+        echo "The SSH user CA was installed but sshd is not serving it" >&2
         on_error 1 "$LINENO"
       fi
-      ssh-keygen -l -f /home/admin/.ssh/authorized_keys >/dev/null
+#% endif
 
-      install -d -m 0755 /run/sshd
-      /usr/sbin/sshd -t
+      if [ -z "$ssh_anchor" ]; then
+        echo \
+          "No SSH key was supplied through Proxmox cloud-init data and no SSH user CA is trusted" \
+          >&2
+        on_error 1 "$LINENO"
+      fi
+      echo "SSH access anchored by: $ssh_anchor"
 
       systemctl daemon-reload
       /usr/lib/systemd/systemd-sysctl

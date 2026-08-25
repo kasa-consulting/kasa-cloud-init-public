@@ -59,6 +59,17 @@ STRICT_RP_FILTER_KEYS = (
 HARDENING_SYSCTL_PATH = "/etc/sysctl.d/60-hardening.conf"
 VENDOR_SYSCTL_BASELINE = "50-default.conf"
 
+# The sshd drop-ins, in the order OpenSSH reads them. 60- before 99- matters: OpenSSH
+# takes the first value it sees for most keywords, so the CA drop-in must not be able to
+# shadow the hardening one.
+HARDENING_SSHD_PATH = "/etc/ssh/sshd_config.d/99-harden.conf"
+SSH_USER_CA_KEY_PATH = "/etc/ssh/kasa_user_ca.pub"
+SSH_USER_CA_DROPIN_PATH = "/etc/ssh/sshd_config.d/60-kasa-user-ca.conf"
+
+# Same shape kasa-ansible/roles/kasa_ssh_ca asserts, so a key one accepts and the other
+# rejects cannot exist.
+OPENSSH_PUBLIC_KEY = r"(ssh-ed25519|ssh-rsa|ecdsa-sha2-[a-z0-9-]+) [A-Za-z0-9+/]+=*( .*)?"
+
 # Paths that must appear only in the docker profile.
 DOCKER_ONLY_PATHS = (
     "/etc/apt/sources.list.d/docker.sources",
@@ -173,7 +184,7 @@ def validate_ssh_source_restriction(profile: Profile, document: dict) -> None:
     """Require the exact additive AllowUsers policy on every profile."""
     name = profile.name
     sshd = files_by_path(document).get(
-        "/etc/ssh/sshd_config.d/99-harden.conf", {}
+        HARDENING_SSHD_PATH, {}
     ).get("content", "")
     entries: list[str] = []
     for line in strip_comments(sshd).splitlines():
@@ -239,6 +250,157 @@ def validate_strict_rp_filter(profile: Profile, document: dict) -> None:
                 )
 
 
+def validate_ssh_user_ca(profile: Profile, document: dict) -> None:
+    """Check SSH user CA trust: both files or neither, and exactly one directive.
+
+    The failure this exists to prevent is a host that looks configured and trusts
+    nothing -- a live TrustedUserCAKeys pointing at a file that is absent, empty or
+    malformed. sshd -t exits 0 in every one of those cases.
+
+    Paths and content must match kasa-ansible/roles/kasa_ssh_ca, which writes the same
+    files on the same hosts. A difference there makes that role rewrite them and reload
+    sshd on every host this template builds.
+    """
+    name = profile.name
+    files = files_by_path(document)
+    key_entry = files.get(SSH_USER_CA_KEY_PATH)
+    dropin_entry = files.get(SSH_USER_CA_DROPIN_PATH)
+
+    configured = bool(CONFIG["SSH_USER_CA_PUBLIC_KEY"])
+    if not configured:
+        # Nothing may appear from anywhere but configuration. A hardcoded anchor would
+        # reach the public mirror, which publishes this template.
+        for path, entry in ((SSH_USER_CA_KEY_PATH, key_entry),
+                            (SSH_USER_CA_DROPIN_PATH, dropin_entry)):
+            if entry is not None:
+                report(name, f"{path} is present but SSH_USER_CA_PUBLIC_KEY is not set")
+        return
+
+    if key_entry is None or dropin_entry is None:
+        missing = SSH_USER_CA_KEY_PATH if key_entry is None else SSH_USER_CA_DROPIN_PATH
+        report(
+            name,
+            f"SSH user CA trust is half-installed: {missing} is missing. The key and the "
+            "sshd drop-in must appear together or not at all.",
+        )
+        return
+
+    key_lines = [
+        line.strip()
+        for line in key_entry.get("content", "").splitlines()
+        if line.strip()
+    ]
+    if len(key_lines) != 1:
+        report(
+            name,
+            f"{SSH_USER_CA_KEY_PATH} must hold exactly one public key line, "
+            f"found {len(key_lines)}",
+        )
+    elif "-cert-v01@openssh.com" in key_lines[0]:
+        report(name, f"{SSH_USER_CA_KEY_PATH} holds a certificate, not a CA public key")
+    elif not re.fullmatch(OPENSSH_PUBLIC_KEY, key_lines[0]):
+        report(name, f"{SSH_USER_CA_KEY_PATH} is not an OpenSSH public key")
+    elif key_lines[0] != CONFIG["SSH_USER_CA_PUBLIC_KEY"].strip():
+        report(
+            name,
+            f"{SSH_USER_CA_KEY_PATH} does not match SSH_USER_CA_PUBLIC_KEY. The anchor "
+            "must come from configuration, so a hardcoded key cannot reach the published "
+            "template.",
+        )
+
+    directives = [
+        line.strip()
+        for line in strip_comments(dropin_entry.get("content", "")).splitlines()
+        if line.strip()
+    ]
+    expected = [f"TrustedUserCAKeys {SSH_USER_CA_KEY_PATH}"]
+    if directives != expected:
+        report(
+            name,
+            f"{SSH_USER_CA_DROPIN_PATH} must contain exactly {expected}, found {directives}",
+        )
+
+    # AllowUsers and AuthenticationMethods belong to 99-harden.conf, whose source of
+    # truth is SSH_ALLOW_USERS. Emitting either here forks that, and OpenSSH takes the
+    # first value it sees -- so the fork would win.
+    for forbidden in (
+        "AllowUsers",
+        "AuthenticationMethods",
+        "PasswordAuthentication",
+        "PermitRootLogin",
+    ):
+        if any(re.match(rf"(?i){forbidden}\b", line) for line in directives):
+            report(
+                name,
+                f"{SSH_USER_CA_DROPIN_PATH} must not set {forbidden}; that belongs to "
+                f"{HARDENING_SSHD_PATH}",
+            )
+
+    if Path(SSH_USER_CA_DROPIN_PATH).name >= Path(HARDENING_SSHD_PATH).name:
+        report(
+            name,
+            f"{SSH_USER_CA_DROPIN_PATH} must sort before {HARDENING_SSHD_PATH}",
+        )
+
+    finalize = files.get("/usr/local/sbin/cloud-init-finalize", {}).get("content", "")
+    for required in (
+        f"ssh-keygen -l -f {SSH_USER_CA_KEY_PATH}",
+        "trustedusercakeys",
+    ):
+        if required not in finalize:
+            report(
+                name,
+                f"finalize must prove the CA trust is live; missing: {required}",
+            )
+
+
+def validate_ca_certs(profile: Profile, document: dict) -> None:
+    """Check the X.509 trust anchor block.
+
+    remove_defaults is the dangerous one: it drops Debian's CA bundle, which breaks apt
+    over HTTPS and every other fetch in the same boot -- and it fails at first boot on a
+    clone, not at build time.
+    """
+    name = profile.name
+    anchors = document.get("ca_certs")
+    configured = bool(CONFIG["KASA_ROOT_CA_FILE"])
+
+    if anchors is None:
+        if configured:
+            report(name, "KASA_ROOT_CA_FILE is set but the render has no ca_certs block")
+        return
+    if not configured:
+        report(name, "ca_certs is present but KASA_ROOT_CA_FILE is not set")
+        return
+    if not isinstance(anchors, dict):
+        report(name, "ca_certs must be a mapping")
+        return
+    if anchors.get("remove_defaults"):
+        report(
+            name,
+            "ca_certs must not set remove_defaults: dropping Debian's CA bundle breaks "
+            "apt over HTTPS in the same boot",
+        )
+
+    trusted = anchors.get("trusted")
+    if not isinstance(trusted, list) or not trusted:
+        report(name, "ca_certs.trusted must be a non-empty list")
+        return
+    for entry in trusted:
+        if not isinstance(entry, str):
+            report(name, "ca_certs.trusted entries must be PEM strings")
+            continue
+        if "PRIVATE KEY" in entry:
+            report(name, "ca_certs.trusted contains a private key")
+        count = entry.count("-----BEGIN CERTIFICATE-----")
+        if count != 1:
+            report(
+                name,
+                f"ca_certs.trusted entry must hold exactly one PEM certificate, "
+                f"found {count}",
+            )
+
+
 def validate_common(profile: Profile, document: dict, rendered: str) -> None:
     name = profile.name
 
@@ -300,7 +462,7 @@ def validate_common(profile: Profile, document: dict, rendered: str) -> None:
                 f"{entry['path']}: permissions must be quoted so 0644 is not octal-parsed",
             )
 
-    sshd = files.get("/etc/ssh/sshd_config.d/99-harden.conf", {}).get("content", "")
+    sshd = files.get(HARDENING_SSHD_PATH, {}).get("content", "")
     for directive in (
         "PasswordAuthentication no",
         "PermitRootLogin no",
@@ -1540,9 +1702,33 @@ def validate_generated_lxc_bundle(release: str) -> None:
             errors.append(f"{container.name}: {error}")
 
 
-def validate_no_secrets(profile: Profile, rendered: str) -> None:
+def validate_no_secrets(
+    profile: Profile, rendered: str, *, exempt_ca_key: bool = False
+) -> None:
+    """Refuse key material in a rendered artifact.
+
+    One exemption, and only one: the SSH user CA public key at
+    /etc/ssh/kasa_user_ca.pub. It is a trust anchor rather than a credential -- holding it
+    grants nothing, and hosts cannot trust the CA without it -- so it is distributed on
+    purpose. Everything else this scans for stays forbidden, including a second copy of
+    that same key, because exactly one occurrence is removed rather than all of them.
+
+    Both artifact families carry the anchor -- the cloud-config as a write_files entry,
+    the LXC bootstrap as an install_file heredoc -- so both pass exempt_ca_key. An
+    operator key or a private key in either is still a failure.
+    """
+    scanned = rendered
+    if exempt_ca_key:
+        ca_key = CONFIG["SSH_USER_CA_PUBLIC_KEY"].strip()
+        if ca_key:
+            # One occurrence, not all of them: a second copy is not a trust anchor and
+            # still trips the scan. validate_ssh_user_ca separately pins the anchor to
+            # this exact configured value, so exempting the string cannot exempt
+            # anything else.
+            scanned = scanned.replace(ca_key, "", 1)
+
     for marker in ("ssh_authorized_keys", "PRIVATE KEY", "ssh-ed25519 AAAA", "ssh-rsa AAAA"):
-        if marker in rendered:
+        if marker in scanned:
             report(profile.name, f"rendered artifact contains key material: {marker}")
 
 
@@ -1567,8 +1753,9 @@ def validate_generated_bundle(release: str) -> None:
     """Validate every generated Proxmox script through the main validator."""
     image = load_image(release)
     vendors = vendor_artifacts(release, dict(STUB_PROVENANCE))
-    for vendor in vendors:
+    for profile, vendor in zip(PROFILES, vendors):
         command = render_command(
+            profile=profile,
             vendor=vendor,
             image=image,
             public_key=TEST_SSH_PUBLIC_KEY,
@@ -1727,7 +1914,9 @@ def main() -> int:
         validate_remote_syslog(profile, document)
         validate_appdata(profile, document)
         validate_docker_rootless(profile, document)
-        validate_no_secrets(profile, content)
+        validate_ssh_user_ca(profile, document)
+        validate_ca_certs(profile, document)
+        validate_no_secrets(profile, content, exempt_ca_key=True)
 
     containers = lxc_artifacts(
         arguments.release, dict(STUB_PROVENANCE), TEST_SSH_PUBLIC_KEY
@@ -1746,9 +1935,10 @@ def main() -> int:
         validate_lxc_idempotence(profile, bootstrap)
         validate_lxc_provenance(profile, bootstrap)
         validate_lxc_features(profile, container.command)
-        # The create script legitimately carries the operator's public key; the
-        # bootstrap must never carry key material at all.
-        validate_no_secrets(profile, bootstrap)
+        # The create script legitimately carries the operator's public keys. The
+        # bootstrap carries the CA public key -- a trust anchor, not a credential -- and
+        # must carry no other key material.
+        validate_no_secrets(profile, bootstrap, exempt_ca_key=True)
 
     validate_writer_boundary()
     validate_manifest_matches_config()

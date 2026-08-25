@@ -28,7 +28,9 @@ BRIDGE=@@BRIDGE@@
 VLAN_TAG=@@LXC_VLAN_TAG@@
 NAMESERVER=@@LXC_NAMESERVER@@
 TIMEZONE=@@TIMEZONE@@
+#% if ssh_public_key
 SSH_PUBLIC_KEY=@@SSH_PUBLIC_KEY@@
+#% endif
 BOOTSTRAP_NAME=@@BOOTSTRAP_NAME@@
 BOOTSTRAP_SHA256=@@BOOTSTRAP_SHA256@@
 
@@ -124,13 +126,20 @@ if [ -f "$bootstrap_path" ]; then
   have_bootstrap=yes
 fi
 
+# Guarded the same way the VM script guards its own temp file, because a CA-only
+# build injects no key at all and there is then nothing to remove.
+ssh_key_file=""
+cleanup() { [ -z "$ssh_key_file" ] || rm -f "$ssh_key_file"; }
+trap cleanup EXIT
+#% if ssh_public_key
 ssh_key_file=$(mktemp --suffix=.pub "/root/kasa-ct-${CTID}-key.XXXXXXXX")
 chmod 0600 "$ssh_key_file"
-cleanup() { rm -f "$ssh_key_file"; }
-trap cleanup EXIT
+# One key per line. ssh-keygen -l reports every key in the file, so one call
+# validates all of them.
 printf '%s\n' "$SSH_PUBLIC_KEY" >"$ssh_key_file"
 ssh-keygen -l -f "$ssh_key_file" >/dev/null \
-  || fail "the built-in SSH public key is not valid"
+  || fail "the built-in SSH public keys are not valid"
+#% endif
 
 # Proxmox verifies the appliance catalogue signature and the downloaded template
 # against it, so there is no separate checksum to carry here.
@@ -171,7 +180,9 @@ pct create "$CTID" "$template_volume" \
   --swap "$SWAP" \
   --net0 "$net0" \
   --timezone "$TIMEZONE" \
+#% if ssh_public_key
   --ssh-public-keys "$ssh_key_file" \
+#% endif
   --onboot 1 \
   --start 0 \
   "${optional_args[@]}"

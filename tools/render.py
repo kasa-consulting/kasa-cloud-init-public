@@ -47,11 +47,13 @@ SITE_KEYS = {
     "APPDATA_WWN",
     "APPDATA_SERIAL",
     "SSH_ALLOW_USERS",
+    "SSH_USER_CA_PUBLIC_KEY",
 }
 BUILD_KEYS = {
     "VMID_START",
     "NAME_PREFIX",
     "SSH_PUBLIC_KEY_FILE",
+    "KASA_ROOT_CA_FILE",
     "ARTIFACT_OUTPUT_DIR",
     "SNIPPET_STORAGE_NAME",
     "ISO_STORAGE_PATH",
@@ -83,11 +85,34 @@ LXC_KEY_DEFAULTS = {
     "LXC_NAMESERVER": "",
 }
 LXC_KEYS = frozenset(LXC_KEY_DEFAULTS)
-CONFIG_KEYS = SITE_KEYS | BUILD_KEYS | LXC_KEYS
+
+# Trust anchors, optional for the same reason the LXC keys are: an existing tools/.env
+# predates them, and a missing key must select "not configured" rather than fail a build
+# that worked yesterday. Empty is a supported, published state -- it is what the public
+# mirror renders.
+TRUST_KEY_DEFAULTS = {
+    "SSH_USER_CA_PUBLIC_KEY": "",
+    "KASA_ROOT_CA_FILE": "",
+}
+TRUST_KEYS = frozenset(TRUST_KEY_DEFAULTS)
+
+CONFIG_KEYS = SITE_KEYS | BUILD_KEYS | LXC_KEYS | TRUST_KEYS
 
 # An empty value means "not configured" rather than a malformed line.
+#
+# SSH_PUBLIC_KEY_FILE is optional only in company: load_config refuses a build with
+# neither an injected key nor a CA, because that VM would be unreachable. Either one
+# alone is a supported shape -- key-only is what every existing template is, and
+# CA-only is the point of trusting the CA at first boot.
 OPTIONAL_EMPTY_KEYS = frozenset(
-    {"SSH_ALLOW_USERS", "LXC_VLAN_TAG", "LXC_NAMESERVER"}
+    {
+        "SSH_ALLOW_USERS",
+        "SSH_PUBLIC_KEY_FILE",
+        "SSH_USER_CA_PUBLIC_KEY",
+        "KASA_ROOT_CA_FILE",
+        "LXC_VLAN_TAG",
+        "LXC_NAMESERVER",
+    }
 )
 
 
@@ -327,11 +352,12 @@ def load_config(profiles: tuple[Profile, ...]) -> dict[str, str]:
             raw_value, line_number, allow_empty=key in OPTIONAL_EMPTY_KEYS
         )
 
-    missing = sorted(CONFIG_KEYS - LXC_KEYS - values.keys())
+    missing = sorted(CONFIG_KEYS - LXC_KEYS - TRUST_KEYS - values.keys())
     if missing:
         raise ValueError(f"{CONFIG_FILE}: missing required keys: {missing}")
-    for key, default in LXC_KEY_DEFAULTS.items():
-        values.setdefault(key, default)
+    for defaults in (LXC_KEY_DEFAULTS, TRUST_KEY_DEFAULTS):
+        for key, default in defaults.items():
+            values.setdefault(key, default)
 
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}", values["BRIDGE"]):
         raise ValueError(f"{CONFIG_FILE}: BRIDGE contains unsupported characters")
@@ -385,6 +411,40 @@ def load_config(profiles: tuple[Profile, ...]) -> dict[str, str]:
             raise ValueError(
                 f"{CONFIG_FILE}: SSH_ALLOW_USERS currently supports IPv4 only: {entry}"
             )
+
+    # The SSH user CA public key, baked into the guest as a trust anchor.
+    #
+    # Same regex kasa-ansible's roles/kasa_ssh_ca asserts, deliberately: the two write the
+    # same file on the same hosts, and a key one accepts and the other rejects would mean a
+    # host trusting something Ansible would then refuse to converge.
+    #
+    # A certificate is rejected explicitly. It is the most plausible wrong value here --
+    # `bao read ssh/config/ca` and a signed cert are both "the SSH CA thing" to anyone who
+    # has not read the docs -- and TrustedUserCAKeys pointed at a certificate silently
+    # trusts nothing.
+    ca_key = values["SSH_USER_CA_PUBLIC_KEY"]
+    if ca_key:
+        if "-cert-v01@openssh.com" in ca_key:
+            raise ValueError(
+                f"{CONFIG_FILE}: SSH_USER_CA_PUBLIC_KEY is a signed certificate, not a CA "
+                "public key. Read the CA public half: "
+                "curl -fsS https://<openbao>/v1/ssh/public_key"
+            )
+        if not re.fullmatch(
+            r"(ssh-ed25519|ssh-rsa|ecdsa-sha2-[a-z0-9-]+) [A-Za-z0-9+/]+=*( .*)?",
+            ca_key,
+        ):
+            raise ValueError(
+                f"{CONFIG_FILE}: SSH_USER_CA_PUBLIC_KEY is not an OpenSSH public key"
+            )
+
+    # Refuse a template nobody can reach. Either anchor alone is fine; neither is not.
+    if not values["SSH_PUBLIC_KEY_FILE"] and not ca_key:
+        raise ValueError(
+            f"{CONFIG_FILE}: set SSH_PUBLIC_KEY_FILE, SSH_USER_CA_PUBLIC_KEY, or both. "
+            "With neither, the built template has no way to authenticate anyone and the "
+            "first boot fails on purpose rather than producing an unreachable VM."
+        )
 
     # A bad timezone only surfaces at first boot, where it is expensive to see.
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9+_-]*(?:/[A-Za-z0-9+_-]+){0,2}", values["TIMEZONE"]):
@@ -512,6 +572,61 @@ def _ssh_allow_users_directive() -> str:
     return "# AllowUsers source restriction is not configured"
 
 
+def resolve_config_path(value: str) -> Path:
+    """Resolve a path named in .env, relative to the .env file rather than the cwd.
+
+    Shared with build.py so both agree. Relative-to-tools/ is not the obvious reading --
+    `./tools/keys.pub` in tools/.env resolves to tools/tools/keys.pub -- so callers report
+    the resolved path in their errors rather than the configured string.
+    """
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = CONFIG_FILE.parent / path
+    return path
+
+
+def _root_ca_pem() -> str:
+    """Read the CA named by KASA_ROOT_CA_FILE, or return "" when unconfigured.
+
+    Structural checks only. The certificate is parsed and its expiry checked in build.py,
+    which already shells out to openssl; this module runs no subprocesses.
+    """
+    configured = CONFIG["KASA_ROOT_CA_FILE"]
+    if not configured:
+        return ""
+    path = resolve_config_path(configured)
+    if not path.is_file():
+        raise ValueError(
+            f"{CONFIG_FILE}: KASA_ROOT_CA_FILE does not exist: {path} "
+            f"(configured as {configured!r}, resolved against {CONFIG_FILE.parent})"
+        )
+    pem = path.read_text(encoding="utf-8").strip()
+    if "PRIVATE KEY" in pem:
+        raise ValueError(
+            f"{path}: contains a private key. KASA_ROOT_CA_FILE is the CA certificate, "
+            "which is public; the private half never leaves OpenBao."
+        )
+    count = pem.count("-----BEGIN CERTIFICATE-----")
+    if count != 1:
+        raise ValueError(
+            f"{path}: expected exactly one PEM certificate, found {count}. The root CA is "
+            "a single self-signed certificate, not a chain."
+        )
+    return pem
+
+
+try:
+    ROOT_CA_PEM = _root_ca_pem()
+except ValueError as error:
+    # Same shape as the load_config failure above: operators see one ERROR line, not a
+    # traceback, because this is a configuration mistake rather than a bug.
+    raise SystemExit(f"ERROR: {error}") from None
+
+
+def _ssh_user_ca_configured() -> bool:
+    return bool(CONFIG["SSH_USER_CA_PUBLIC_KEY"])
+
+
 def expand_template(
     template: Path, flags: dict[str, bool], replacements: dict[str, str]
 ) -> str:
@@ -547,19 +662,36 @@ def expand_template(
             continue
 
         line = raw_line
+
+        # A multi-line value -- an armoured GPG key, a PEM certificate, a list of SSH
+        # public keys -- has to be re-indented onto every line it produces, or it lands
+        # unindented inside a YAML block scalar and the document silently changes shape.
+        # The text before the placeholder is the indent, which is why these are matched
+        # before the ordinary substitutions run and why such a placeholder must sit alone
+        # on its line.
+        block = next(
+            (
+                (placeholder, value)
+                for placeholder, value in replacements.items()
+                if "\n" in value and placeholder in line
+            ),
+            None,
+        )
+        if block is not None:
+            placeholder, value = block
+            prefix = line[: line.index(placeholder)]
+            output.extend(
+                f"{prefix}{value_line}" if value_line else prefix.rstrip()
+                for value_line in value.splitlines()
+            )
+            continue
+
         for placeholder, value in replacements.items():
             line = line.replace(placeholder, value)
-        if "@@DOCKER_GPG_KEY@@" in line:
-            prefix = line[: line.index("@@DOCKER_GPG_KEY@@")]
-            output.extend(
-                f"{prefix}{key_line}" if key_line else prefix.rstrip()
-                for key_line in DOCKER_KEY.read_text(encoding="utf-8").splitlines()
-            )
-        else:
-            unresolved = re.findall(r"@@[A-Z0-9_]+@@", line)
-            if unresolved:
-                raise ValueError(f"Unresolved template placeholders: {unresolved}")
-            output.append(line)
+        unresolved = re.findall(r"@@[A-Z0-9_]+@@", line)
+        if unresolved:
+            raise ValueError(f"Unresolved template placeholders: {unresolved}")
+        output.append(line)
 
     if len(active_stack) != 1:
         raise ValueError("Unclosed template conditional")
@@ -574,7 +706,27 @@ def expand_template(
 
 
 def profile_flags(profile: Profile) -> dict[str, bool]:
-    return {flag: flag in profile.flags for flag in KNOWN_FLAGS}
+    """Flags a template may test, from the profile and from configuration.
+
+    KNOWN_FLAGS gates what templates/profiles.yaml may declare. This dict gates what a
+    template may test, and expand_template checks against this -- so `ssh_user_ca` and
+    `kasa_root_ca` are driven by whether the operator configured an anchor, not by which
+    profile is building. The profile matrix is unchanged.
+
+    Unconfigured renders the blocks away entirely rather than emitting an empty file. That
+    matters twice: an empty /etc/ssh/kasa_user_ca.pub under a live TrustedUserCAKeys is a
+    host that looks configured and trusts nothing, and this template is published, so the
+    public render must carry no anchor at all.
+    """
+    return {
+        **{flag: flag in profile.flags for flag in KNOWN_FLAGS},
+        "ssh_user_ca": _ssh_user_ca_configured(),
+        "kasa_root_ca": bool(ROOT_CA_PEM),
+        # Whether any operator key is injected at all. A CA-only build must not pass
+        # --sshkeys, and must not assert that Proxmox generated authorized keys it was
+        # never given.
+        "ssh_public_key": bool(CONFIG["SSH_PUBLIC_KEY_FILE"]),
+    }
 
 
 def render(profile: Profile, release: str = DEFAULT_RELEASE, **extra: str) -> str:
@@ -590,6 +742,9 @@ def render(profile: Profile, release: str = DEFAULT_RELEASE, **extra: str) -> st
         "@@APPDATA_WWN@@": SITE["APPDATA_WWN"],
         "@@APPDATA_SERIAL@@": SITE["APPDATA_SERIAL"],
         "@@SSH_ALLOW_USERS_DIRECTIVE@@": _ssh_allow_users_directive(),
+        "@@SSH_USER_CA_PUBLIC_KEY@@": CONFIG["SSH_USER_CA_PUBLIC_KEY"],
+        "@@KASA_ROOT_CA_PEM@@": ROOT_CA_PEM,
+        "@@DOCKER_GPG_KEY@@": DOCKER_KEY.read_text(encoding="utf-8"),
     }
     replacements.update({f"@@{key}@@": value for key, value in extra.items()})
     return expand_template(
@@ -617,6 +772,9 @@ def render_lxc(profile: Profile, release: str = DEFAULT_RELEASE, **extra: str) -
         "@@TIMEZONE@@": SITE["TIMEZONE"],
         "@@APPDATA_MOUNT@@": APPDATA_MOUNT,
         "@@SSH_ALLOW_USERS_DIRECTIVE@@": _ssh_allow_users_directive(),
+        "@@SSH_USER_CA_PUBLIC_KEY@@": CONFIG["SSH_USER_CA_PUBLIC_KEY"],
+        "@@KASA_ROOT_CA_PEM@@": ROOT_CA_PEM,
+        "@@DOCKER_GPG_KEY@@": DOCKER_KEY.read_text(encoding="utf-8"),
     }
     replacements.update({f"@@{key}@@": value for key, value in extra.items()})
     return expand_template(

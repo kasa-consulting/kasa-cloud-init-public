@@ -437,6 +437,39 @@ MaxSessions 5
 MaxStartups 10:30:100
 EOF
 
+#% if ssh_user_ca
+# Trust for the KASA SSH user CA, so a container is reachable with a short-lived
+# certificate from its first bootstrap. Same two paths and same content as the VM
+# template and kasa-ansible/roles/kasa_ssh_ca; a difference makes that role rewrite
+# them and reload sshd on every new guest.
+#
+# 60- rather than 99-: OpenSSH takes the first value it sees for most keywords, and the
+# hardening file above owns AllowUsers and AuthenticationMethods.
+install_file /etc/ssh/kasa_user_ca.pub 0644 <<'EOF'
+@@SSH_USER_CA_PUBLIC_KEY@@
+EOF
+
+install_file /etc/ssh/sshd_config.d/60-kasa-user-ca.conf 0644 <<'EOF'
+# KASA SSH user CA trust. Written by kasa-cloud-init at first boot and converged by
+# kasa-ansible roles/kasa_ssh_ca. Do not edit on the host.
+#
+# Two owners, one byte-identical file, deliberately: a host built from a CA-configured
+# template already has this, and any difference here would make the role rewrite it and
+# reload sshd on every new host. Change one and change the other.
+#
+# This file carries one directive. AllowUsers, AuthenticationMethods and the rest of
+# the hardening live in 99-harden.conf, whose source of truth is SSH_ALLOW_USERS in
+# kasa-cloud-init/tools/.env. Emitting any of them here would fork that.
+TrustedUserCAKeys /etc/ssh/kasa_user_ca.pub
+EOF
+
+# Not redundant with sshd -t below: sshd -t exits 0 against a TrustedUserCAKeys naming a
+# file that is missing or truncated, so this is the only check that catches a malformed
+# CA key.
+ssh-keygen -l -f /etc/ssh/kasa_user_ca.pub >/dev/null \
+  || fail "the SSH user CA public key is malformed"
+#% endif
+
 install -d -m 0755 /run/sshd
 /usr/sbin/sshd -t || fail "the new sshd configuration is invalid; root access is unchanged"
 systemctl enable ssh.service
@@ -741,8 +774,27 @@ if findmnt --noheadings --output FSTYPE --mountpoint /var/log 2>/dev/null \
   fail "/var/log is backed by tmpfs; packages that create log directories would lose them"
 fi
 
-[ -s "$ADMIN_KEYS" ] || fail "admin has no authorized_keys"
-[ "$(stat -c '%a' "$ADMIN_KEYS")" = 600 ] || fail "admin's authorized_keys is not mode 0600"
+# A guest needs at least one way to authenticate an operator. Either anchor alone is
+# enough; neither means a container nobody can enter, so failing here is the point.
+ssh_anchor=""
+if [ -s "$ADMIN_KEYS" ]; then
+  [ "$(stat -c '%a' "$ADMIN_KEYS")" = 600 ] \
+    || fail "admin's authorized_keys is not mode 0600"
+  ssh_anchor="authorized_keys"
+fi
+#% if ssh_user_ca
+# sshd -T reads the effective configuration, so a drop-in that parsed but was ignored
+# still shows up here as absent.
+if /usr/sbin/sshd -T 2>/dev/null \
+    | grep -qi '^trustedusercakeys /etc/ssh/kasa_user_ca\.pub$'; then
+  ssh_anchor="${ssh_anchor:+$ssh_anchor and }SSH user CA"
+else
+  fail "the SSH user CA was installed but sshd is not serving it"
+fi
+#% endif
+[ -n "$ssh_anchor" ] \
+  || fail "admin has no authorized_keys and no SSH user CA is trusted"
+log "SSH access anchored by: $ssh_anchor"
 [ "$(stat -c '%a' /home/admin)" = 700 ] || fail "/home/admin is not mode 0700"
 [ "$(stat -c '%a' /home/admin/.ssh)" = 700 ] || fail "/home/admin/.ssh is not mode 0700"
 

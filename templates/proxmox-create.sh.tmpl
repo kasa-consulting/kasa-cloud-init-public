@@ -19,7 +19,9 @@ APPDATA_WWN=@@APPDATA_WWN@@
 VENDOR_SNIPPET_NAME=@@VENDOR_SNIPPET_NAME@@
 VENDOR_SHA256=@@VENDOR_SHA256@@
 
+#% if ssh_public_key
 SSH_PUBLIC_KEY=@@SSH_PUBLIC_KEY@@
+#% endif
 
 IMAGE_NAME=@@IMAGE_NAME@@
 IMAGE_SHA512=@@IMAGE_SHA512@@
@@ -143,12 +145,15 @@ if [ ! -e "$image_path" ]; then
 fi
 printf '%s  %s\n' "$IMAGE_SHA512" "$image_path" | sha512sum --check -
 
-# Proxmox reads the key from a file and folds it into the user-data it
-# generates, which is also the only place it emits the hostname.
+#% if ssh_public_key
+# Proxmox reads the keys from a file and folds them into the user-data it
+# generates, which is also the only place it emits the hostname. One key per
+# line; ssh-keygen -l reports every key in the file, so one call validates all.
 ssh_key_file="$(mktemp)"
 chmod 0600 "$ssh_key_file"
 printf '%s\n' "$SSH_PUBLIC_KEY" > "$ssh_key_file"
 ssh-keygen -l -f "$ssh_key_file" >/dev/null
+#% endif
 
 create_template() {
   local vmid="$1"
@@ -169,7 +174,9 @@ create_template() {
     --vga serial0 \
     --cicustom "vendor=${vendor_volume}" \
     --ciuser admin \
+#% if ssh_public_key
     --sshkeys "$ssh_key_file" \
+#% endif
     --ciupgrade 0 \
     --agent 1 \
     --ostype l26 \
@@ -208,8 +215,10 @@ create_template() {
   grep -Fxq "user: admin" <<<"$generated_user_data" || \
     fail "Generated user-data is missing user: admin"
 
+#% if ssh_public_key
   grep -q '^ssh_authorized_keys:' <<<"$generated_user_data" || \
     fail "Generated user-data is missing SSH authorized keys"
+#% endif
 
   qm template "$vmid"
   vm_created=0
