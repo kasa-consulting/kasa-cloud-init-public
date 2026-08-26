@@ -1394,6 +1394,32 @@ def validate_lxc_appdata(profile: Profile, bootstrap: str) -> None:
             report(name, f"the LXC bootstrap {message}")
 
 
+def validate_lxc_host_keys(profile: Profile, bootstrap: str) -> None:
+    """Every clone of a template must mint its own SSH host keys.
+
+    Debian's sshd-keygen.service runs `ssh-keygen -A`, which creates only the keys that are
+    missing, so a template shipping a full set gave every clone the same host identity and
+    known_hosts could not tell one guest from another. The bootstrap installs a unit that
+    re-keys when the recorded machine-id stops matching this machine's, which is exactly
+    once per clone.
+    """
+    name = profile.name
+    body = strip_comments(bootstrap)
+    for fragment, message in (
+        ("/usr/local/sbin/kasa-ssh-host-keys", "must install the host key script"),
+        ("kasa-ssh-host-keys.service", "must install the host key unit"),
+        ("Before=ssh.service", "must order host key generation before sshd"),
+        ("/etc/ssh/kasa-host-key-identity", "must record the identity the keys belong to"),
+        ("ssh-keygen -A", "must generate the replacement host keys"),
+        (
+            "systemctl enable kasa-ssh-host-keys.service",
+            "must enable the host key unit at boot",
+        ),
+    ):
+        if fragment not in body:
+            report(name, f"the LXC bootstrap {message}")
+
+
 def validate_lxc_omissions(profile: Profile, bootstrap: str) -> None:
     """Refuse VM-only mechanisms a container cannot honour."""
     body = strip_comments(bootstrap)
@@ -1937,6 +1963,7 @@ def main() -> int:
         validate_lxc_logging(profile, bootstrap)
         validate_lxc_var_log(profile, bootstrap)
         validate_lxc_appdata(profile, bootstrap)
+        validate_lxc_host_keys(profile, bootstrap)
         validate_lxc_omissions(profile, bootstrap)
         validate_lxc_fail2ban(profile, bootstrap)
         validate_lxc_docker(profile, bootstrap)

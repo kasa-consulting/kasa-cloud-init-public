@@ -221,9 +221,21 @@ a trusted user CA, or both. With neither, the boot fails deliberately rather tha
 producing a VM nobody can enter. Both is the ordinary case and the safest one,
 since the injected key is break-glass for a certificate outage.
 
-Host key verification is a separate problem and this does not solve it. These are
-user certificates; the first connection to a new host still has to accept its
-host key.
+Host key verification is a separate problem and a user certificate does not
+solve it: these certificates authenticate the operator to the guest, not the
+guest to the operator, so the first connection to a new host still has to accept
+its host key.
+
+What the container profiles do guarantee is that the host key is *this guest's*.
+Debian's `sshd-keygen.service` runs `ssh-keygen -A`, which creates only the keys
+that are missing, so a template that shipped a full set gave every clone the same
+host identity — the private key naming one guest sitting in every sibling built
+from the same template, with `known_hosts` unable to tell them apart. The
+bootstrap installs `kasa-ssh-host-keys.service`, which records the machine-id its
+keys belong to and re-keys before sshd starts whenever that stops matching. A
+clone changes machine-id exactly once, so it re-keys exactly once. Verify a new
+guest's fingerprint out of band — `pct exec` for a container, `qm guest exec` for
+a VM — rather than accepting what the network offers.
 
 The docker profile adds `docker-ce`, `docker-ce-cli`, `containerd.io`,
 `docker-buildx-plugin`, `docker-compose-plugin`, `docker-ce-rootless-extras`

@@ -495,6 +495,80 @@ printf '%s\n' "$sshd_effective" | grep -qx 'pubkeyauthentication yes' \
   || fail "sshd does not accept public-key authentication"
 log "sshd hardened; log in as admin from here on"
 
+# --- Per-instance SSH host keys ----------------------------------------------
+# A container built from this profile becomes a Proxmox template, and every clone of that
+# template used to present the same SSH host identity.
+#
+# Why it happened, because the mechanism is not obvious: `pct clone` empties
+# /etc/machine-id, so the clone does boot as systemd's first boot and Debian's
+# sshd-keygen.service does run -- but it runs `ssh-keygen -A`, which creates only the keys
+# that are absent. A template holding a full set therefore satisfied it, and nothing
+# regenerated anything. Measured on 2026-08-25: template 9100 and the container cloned from
+# it held byte-identical host keys.
+#
+# What that costs: the private key identifying one guest sits in every sibling built from
+# the same template, so known_hosts cannot tell them apart and a compromise of any one of
+# them is enough to impersonate the rest.
+#
+# Keyed on identity rather than on the keys being absent, deliberately. Absence would work
+# for a template that ships none, but it makes correctness depend on a build-time step
+# nobody is reminded of, and it silently strips the identity of an existing container this
+# bootstrap is re-run against. The machine-id comparison is right in both cases and needs no
+# discipline.
+install_file /usr/local/sbin/kasa-ssh-host-keys 0755 <<'EOF'
+#!/bin/bash
+# Give this instance SSH host keys that belong to it. Installed by the KASA LXC bootstrap.
+#
+# Runs before sshd on every boot and does nothing at all unless the recorded identity
+# disagrees with this machine's -- which happens exactly once per clone.
+set -Eeuo pipefail
+
+marker=/etc/ssh/kasa-host-key-identity
+current=$(cat /etc/machine-id)
+
+# An empty machine-id means systemd has not populated it yet. Re-keying against an identity
+# that is about to change would leave the marker permanently wrong, so leave it to the boot
+# that has one.
+if [ -z "$current" ]; then
+  printf 'kasa-ssh-host-keys: /etc/machine-id is empty; deferring\n' >&2
+  exit 0
+fi
+
+if [ -f "$marker" ] && [ "$(cat "$marker")" = "$current" ] \
+   && [ -f /etc/ssh/ssh_host_ed25519_key ]; then
+  exit 0
+fi
+
+rm -f /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub
+ssh-keygen -A
+printf '%s\n' "$current" >"$marker"
+chmod 0644 "$marker"
+printf 'kasa-ssh-host-keys: generated host keys for %s\n' "$current" >&2
+EOF
+
+install_file /etc/systemd/system/kasa-ssh-host-keys.service 0644 <<'EOF'
+[Unit]
+Description=Give this instance its own SSH host keys
+# Before sshd rather than wanted by multi-user.target: a clone that served one connection
+# on an inherited key has already leaked the property this protects.
+Before=ssh.service sshd.service
+ConditionPathIsReadWrite=/etc/ssh
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/kasa-ssh-host-keys
+RemainAfterExit=yes
+
+[Install]
+WantedBy=ssh.service sshd.service
+EOF
+
+# Record this container's own identity now, so the keys it is running with are accounted
+# for and the next boot is a no-op. A clone gets a different machine-id and re-keys.
+printf '%s\n' "$(cat /etc/machine-id)" >/etc/ssh/kasa-host-key-identity
+chmod 0644 /etc/ssh/kasa-host-key-identity
+log "per-instance SSH host keys armed for clones of this container"
+
 # --- sysctl ------------------------------------------------------------------
 # Only keys the container actually owns. A container shares the host kernel, so
 # kernel.*, fs.* and vm.* are read-only here; they are Proxmox host settings and
@@ -796,6 +870,18 @@ systemctl enable kasa-appdata-guard.service >/dev/null
 systemctl restart kasa-appdata-guard.service
 systemctl is-active --quiet kasa-appdata-guard.service \
   || fail "kasa-appdata-guard.service did not succeed"
+
+systemctl enable kasa-ssh-host-keys.service >/dev/null
+# The unit is a no-op while the marker matches this machine, which is what a correctly
+# bootstrapped container looks like -- so assert the wiring and the recorded identity
+# rather than a re-key that must not happen here.
+systemctl is-enabled --quiet kasa-ssh-host-keys.service \
+  || fail "kasa-ssh-host-keys.service is not enabled at boot"
+[ "$(cat /etc/ssh/kasa-host-key-identity)" = "$(cat /etc/machine-id)" ] \
+  || fail "the recorded SSH host key identity does not match /etc/machine-id"
+systemctl start kasa-ssh-host-keys.service
+[ -f /etc/ssh/ssh_host_ed25519_key ] \
+  || fail "kasa-ssh-host-keys removed the host keys without replacing them"
 
 if findmnt --noheadings --output FSTYPE --mountpoint /var/log 2>/dev/null \
     | grep -qx tmpfs; then
