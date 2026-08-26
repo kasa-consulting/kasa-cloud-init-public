@@ -724,8 +724,23 @@ EOF
 sed -i -E \
   's/^[[:space:]]*module\(load="imuxsock".*$/# disabled: using imjournal/; s/^[[:space:]]*module\(load="imklog".*$/# disabled: using imjournal/' \
   /etc/rsyslog.conf
+# Debian's Postfix package adds a legacy imuxsock directive in a drop-in. Once
+# imuxsock is disabled above, leaving that directive active makes rsyslog reject
+# the complete configuration. Remote profiles read the journal instead.
+if [ -f /etc/rsyslog.d/postfix.conf ]; then
+  # The dollar sign belongs to rsyslog's directive.
+  # shellcheck disable=SC2016
+  sed -i -E \
+    's/^[[:space:]]*\$AddUnixListenSocket[[:space:]]+/# disabled: using imjournal: /' \
+    /etc/rsyslog.d/postfix.conf
+fi
 if grep -qE '^[[:space:]]*module\(load="im(uxsock|klog)"' /etc/rsyslog.conf; then
   fail "imuxsock or imklog is still enabled in /etc/rsyslog.conf"
+fi
+# The dollar sign belongs to rsyslog's directive.
+# shellcheck disable=SC2016
+if grep -RqsE '^[[:space:]]*\$AddUnixListenSocket[[:space:]]+' /etc/rsyslog.d; then
+  fail "an AddUnixListenSocket directive is still enabled without imuxsock"
 fi
 
 systemctl restart systemd-journald.service
