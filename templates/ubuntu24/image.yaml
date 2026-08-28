@@ -1,0 +1,13 @@
+# Ubuntu cloud image pin for this release directory.
+#
+# Managed by tools/ubuntu_image_updater.py. The updater verifies Canonical's
+# SHA256 metadata and the downloaded image before changing this immutable pin.
+
+os: ubuntu
+version: "24.04"
+codename: noble
+build: "20260826"
+name: ubuntu-24.04-server-cloudimg-amd64.img
+url: https://cloud-images.ubuntu.com/releases/noble/release-20260826/ubuntu-24.04-server-cloudimg-amd64.img
+checksum_algorithm: sha256
+checksum: d0fe84bb5f80853425fa6be28e2c106f30104c3cfe8611933f2e65c9b63f0e30

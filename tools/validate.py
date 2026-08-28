@@ -25,16 +25,22 @@ from build import (
     validate_generated_lxc,
     vendor_artifacts,
 )
+import debian_image_updater
+from image_pin import load_image_pin
 import render as render_module
+import ubuntu_image_updater
 from render import (
     CONFIG,
     DEFAULT_RELEASE,
     PROFILES,
+    RELEASES,
     ROOT,
     SITE,
+    TEMPLATES,
     SSH_ALLOW_USERS,
     Profile,
     load_image,
+    load_release,
     lxc_template_name,
     render,
     template_name,
@@ -402,7 +408,9 @@ def validate_ca_certs(profile: Profile, document: dict) -> None:
             )
 
 
-def validate_common(profile: Profile, document: dict, rendered: str) -> None:
+def validate_common(
+    profile: Profile, document: dict, rendered: str, release: str
+) -> None:
     name = profile.name
 
     for key, expected in (
@@ -428,29 +436,33 @@ def validate_common(profile: Profile, document: dict, rendered: str) -> None:
     packages = document.get("packages", [])
     if len(packages) != len(set(packages)):
         report(name, "duplicate entries in packages")
-    for required in (
+    required_packages = {
         "cloud-guest-utils",
         "fail2ban",
         "nftables",
         "qemu-guest-agent",
         "rsyslog",
-        "systemd-zram-generator",
         "unattended-upgrades",
-    ):
+    }
+    if release == "deb13":
+        required_packages.add("systemd-zram-generator")
+    for required in required_packages:
         if required not in packages:
             report(name, f"missing required package: {required}")
 
     files = files_by_path(document)
-    for required_path in (
+    required_paths = {
         "/etc/kasa-image-release",
         "/etc/ssh/sshd_config.d/99-harden.conf",
         HARDENING_SYSCTL_PATH,
-        "/etc/systemd/zram-generator.conf",
         "/etc/fail2ban/jail.local",
         "/usr/local/sbin/cloud-init-finalize",
         "/usr/local/sbin/cloud-init-post-verify",
         "/etc/systemd/system/cloud-init-post-verify.service",
-    ):
+    }
+    if release == "deb13":
+        required_paths.add("/etc/systemd/zram-generator.conf")
+    for required_path in required_paths:
         if required_path not in files:
             report(name, f"missing required file: {required_path}")
 
@@ -503,9 +515,13 @@ def validate_common(profile: Profile, document: dict, rendered: str) -> None:
         if fragment not in finalize:
             report(name, f"finalize live rp_filter verification is missing: {fragment}")
 
-    zram = files.get("/etc/systemd/zram-generator.conf", {}).get("content", "")
-    if "compression-algorithm = zstd" not in zram or "zram-size" not in zram:
-        report(name, "zram generator configuration is incomplete")
+    zram_path = "/etc/systemd/zram-generator.conf"
+    if release == "deb13":
+        zram = files.get(zram_path, {}).get("content", "")
+        if "compression-algorithm = zstd" not in zram or "zram-size" not in zram:
+            report(name, "zram generator configuration is incomplete")
+    elif "systemd-zram-generator" in packages or zram_path in files:
+        report(name, "Ubuntu must not carry an unusable zram generator configuration")
 
     jail = files.get("/etc/fail2ban/jail.local", {}).get("content", "")
     if SITE["FAIL2BAN_IGNORE_IPS"] not in jail:
@@ -559,7 +575,9 @@ def validate_common(profile: Profile, document: dict, rendered: str) -> None:
         report(name, "rendered output still contains @@ placeholders")
 
 
-def validate_image_release(profile: Profile, document: dict) -> None:
+def validate_image_release(
+    profile: Profile, document: dict, release: str = DEFAULT_RELEASE
+) -> None:
     name = profile.name
     content = files_by_path(document).get("/etc/kasa-image-release", {}).get(
         "content", ""
@@ -573,7 +591,10 @@ def validate_image_release(profile: Profile, document: dict) -> None:
         "ID",
         "DESCRIPTION",
         "RELEASE",
-        "DEBIAN_IMAGE_BUILD",
+        "OS",
+        "OS_VERSION",
+        "OS_CODENAME",
+        "IMAGE_BUILD",
         "SOURCE_COMMIT",
         "SOURCE_TREE_DIRTY",
         "BUILT_AT",
@@ -588,6 +609,15 @@ def validate_image_release(profile: Profile, document: dict) -> None:
         report(name, "/etc/kasa-image-release must not carry TEMPLATE_VERSION")
     if f"ID={profile.name}" not in content:
         report(name, "/etc/kasa-image-release ID does not match the profile")
+    release_info = load_release(release)
+    for field, expected_value in (
+        ("RELEASE", release_info.name),
+        ("OS", release_info.os),
+        ("OS_VERSION", release_info.version),
+        ("OS_CODENAME", release_info.codename),
+    ):
+        if f"{field}={expected_value}" not in content.splitlines():
+            report(name, f"/etc/kasa-image-release {field} does not match {release}")
 
 
 def validate_rsyslog(profile: Profile, document: dict) -> None:
@@ -705,7 +735,9 @@ def validate_var_log_persistence(profile: Profile, document: dict) -> None:
                 report(name, f"command mounts a tmpfs on /var/log: {line.strip()}")
 
 
-def validate_remote_syslog(profile: Profile, document: dict) -> None:
+def validate_remote_syslog(
+    profile: Profile, document: dict, release: str = DEFAULT_RELEASE
+) -> None:
     """Check the profile-level remote-logging contract.
 
     Its three enforceable properties are a volatile journal, a forwarding queue
@@ -746,6 +778,44 @@ def validate_remote_syslog(profile: Profile, document: dict) -> None:
         report(name, "journald Storage must be volatile")
     if "ForwardToSyslog=no" not in journald:
         report(name, "journald must not forward to syslog; rsyslog reads the journal")
+
+    if release == "ubuntu24":
+        tmpfiles = files.get("/etc/tmpfiles.d/60-kasa-rsyslog.conf", {}).get(
+            "content", ""
+        )
+        if "d /run/rsyslog 0750 syslog adm -" not in tmpfiles:
+            report(name, "Ubuntu rsyslog tmpfiles ownership rule is missing")
+
+        runtime = files.get(
+            "/etc/systemd/system/rsyslog.service.d/10-runtime-dir.conf", {}
+        ).get("content", "")
+        fragment = (
+            "ExecStartPre=/usr/bin/systemd-tmpfiles --create "
+            "/etc/tmpfiles.d/60-kasa-rsyslog.conf"
+        )
+        if fragment not in runtime:
+            report(name, f"Ubuntu rsyslog runtime directory is missing: {fragment}")
+        if "RuntimeDirectory=" in runtime:
+            report(
+                name,
+                "Ubuntu rsyslog must not reset the volatile cursor to root ownership",
+            )
+
+        apparmor = files.get(
+            "/etc/apparmor.d/local/usr.sbin.rsyslogd", {}
+        ).get("content", "")
+        for rule in (
+            "@{run}/log/journal/*/ r,",
+            "@{run}/log/journal/*/** r,",
+            "@{run}/rsyslog/ rw,",
+            "@{run}/rsyslog/** rwk,",
+        ):
+            if rule not in apparmor:
+                report(name, f"Ubuntu rsyslog AppArmor exception is missing: {rule}")
+
+        rsyslog = files.get("/etc/rsyslog.d/01-remote.conf", {}).get("content", "")
+        if 'PersistStateInterval="1"' not in rsyslog:
+            report(name, "Ubuntu imjournal must persist its volatile cursor promptly")
 
     # fail2ban writes its own log file and ban database under /var by default.
     # Both must stay off disk for the memory-only guarantee to mean anything.
@@ -846,7 +916,9 @@ def validate_appdata(profile: Profile, document: dict) -> None:
             report(name, f"finalize must activate APPDATA verification: {fragment}")
 
 
-def validate_docker_rootless(profile: Profile, document: dict) -> None:
+def validate_docker_rootless(
+    profile: Profile, document: dict, release: str = DEFAULT_RELEASE
+) -> None:
     name = profile.name
     files = files_by_path(document)
     finalize = files.get("/usr/local/sbin/cloud-init-finalize", {}).get("content", "")
@@ -868,11 +940,31 @@ def validate_docker_rootless(profile: Profile, document: dict) -> None:
         if path not in files:
             report(name, f"docker profile is missing {path}")
 
+    docker_source = files.get("/etc/apt/sources.list.d/docker.sources", {}).get(
+        "content", ""
+    )
+    expected_repository = {
+        "deb13": (
+            "URIs: https://download.docker.com/linux/debian",
+            "Suites: trixie",
+        ),
+        "ubuntu24": (
+            "URIs: https://download.docker.com/linux/ubuntu",
+            "Suites: noble",
+        ),
+    }[release]
+    for fragment in expected_repository:
+        if fragment not in docker_source:
+            report(name, f"Docker repository is missing {fragment}")
+
     modules_load = files.get(
         "/etc/modules-load.d/60-rootless-docker.conf", {}
     ).get("content", "")
+    # nf_tables is the whole list on both releases. Ubuntu's iptables is
+    # iptables-nft, so the legacy x_tables modules would be loaded surface that
+    # carries no rules.
     if modules_load.strip() != "nf_tables":
-        report(name, "Docker profile must load nf_tables on every boot")
+        report(name, "Docker profile must load nf_tables and nothing else on every boot")
     for package in (
         "dbus-user-session",
         "docker-ce",
@@ -882,6 +974,8 @@ def validate_docker_rootless(profile: Profile, document: dict) -> None:
     ):
         if package not in packages:
             report(name, f"rootless Docker requires the {package} package")
+    if release == "ubuntu24" and "apparmor" not in packages:
+        report(name, "Ubuntu rootless Docker requires the apparmor package")
 
     # Rootless means rootless: the system daemon must never run.
     if "systemctl mask docker.service docker.socket" not in finalize:
@@ -979,6 +1073,22 @@ def validate_docker_rootless(profile: Profile, document: dict) -> None:
         report(name, "sudo su does not set up XDG_RUNTIME_DIR for the setup tool")
     if "dockerd-rootless-setuptool.sh install" not in finalize:
         report(name, "finalize must install the rootless daemon")
+    if release == "ubuntu24":
+        for fragment in (
+            "kernel.apparmor_restrict_unprivileged_userns)",
+            "/etc/apparmor.d/rootlesskit",
+            "/usr/sbin/apparmor_parser -r",
+            "/sys/kernel/security/apparmor/profiles",
+        ):
+            if fragment not in finalize:
+                report(name, f"Ubuntu rootless Docker setup is missing: {fragment}")
+        for forbidden in (
+            "kernel.apparmor_restrict_unprivileged_userns=0",
+            "kernel.apparmor_restrict_unprivileged_userns = 0",
+            "apparmor=0",
+        ):
+            if forbidden in strip_comments(finalize) or forbidden in modules_load:
+                report(name, f"Ubuntu Docker must not weaken AppArmor: {forbidden}")
     modprobe = "/usr/sbin/modprobe nf_tables"
     module_check = "[ -d /sys/module/nf_tables ]"
     installer = "dockerd-rootless-setuptool.sh install"
@@ -993,6 +1103,44 @@ def validate_docker_rootless(profile: Profile, document: dict) -> None:
     # A hardcoded 1000 is correct until it is not, and the failure is silent.
     for match in re.findall(r"/run/user/(\d+)", finalize):
         report(name, f"hardcoded uid {match} in /run/user path; derive it with id -u")
+
+
+def validate_release_specific(
+    profile: Profile, document: dict, rendered: str, release: str
+) -> None:
+    """Validate a distro-specific mechanism for a shared security property."""
+    if release != "ubuntu24":
+        return
+    name = profile.name
+    bootcmd = "\n".join(str(command) for command in document.get("bootcmd", []))
+    for fragment in (
+        "if ! getent passwd admin",
+        "getent group admin",
+        "/usr/sbin/useradd",
+        "--gid admin",
+        "--groups adm,cdrom,dip,lxd,sudo",
+        "passwd --lock admin",
+    ):
+        if fragment not in bootcmd:
+            report(name, f"Ubuntu existing-admin-group handling is missing: {fragment}")
+    finalize = files_by_path(document).get(
+        "/usr/local/sbin/cloud-init-finalize", {}
+    ).get("content", "")
+    for fragment in (
+        "systemctl disable --now ssh.socket",
+        "systemctl enable ssh.service",
+        "systemctl restart ssh.service",
+    ):
+        if fragment not in finalize:
+            report(name, f"Ubuntu SSH service handling is missing: {fragment}")
+    body = strip_comments(rendered)
+    for forbidden in (
+        "kernel.apparmor_restrict_unprivileged_userns=0",
+        "kernel.apparmor_restrict_unprivileged_userns = 0",
+        "apparmor=0",
+    ):
+        if forbidden in body:
+            report(name, f"Ubuntu must not weaken AppArmor: {forbidden}")
 
 
 # --- LXC profile checks ------------------------------------------------------
@@ -1774,13 +1922,53 @@ def validate_writer_boundary() -> None:
             errors.append(f"render.py must not write files: found {forbidden}")
 
 
-def validate_manifest_matches_config() -> None:
+def validate_manifest_matches_config(release: str = DEFAULT_RELEASE) -> None:
     prefix = CONFIG["NAME_PREFIX"]
-    names = {
-        template_name(profile, DEFAULT_RELEASE, prefix) for profile in PROFILES
-    }
+    names = {template_name(profile, release, prefix) for profile in PROFILES}
     if len(names) != len(PROFILES):
         errors.append("profile names collide after applying release and feature names")
+
+
+def validate_image_pin_is_updater_output(release: str) -> None:
+    """The committed pin must be exactly what its updater would write.
+
+    The pin's own header says it is updater-managed, so a hand-edited comment
+    turns the first automated bump into a diff that looks like an unrelated
+    edit. Comparing the file against the updater's rendering catches that here
+    rather than in the update pull request.
+    """
+    updaters = {"debian": debian_image_updater, "ubuntu": ubuntu_image_updater}
+    path = TEMPLATES / release / "image.yaml"
+    pin = load_image_pin(path)
+    rendered = updaters[pin.os].render_image_pin(pin)
+    if path.read_text(encoding="utf-8") != rendered:
+        errors.append(
+            f"{path} is not what tools/{pin.os}_image_updater.py would write; "
+            "change the updater's IMAGE_FILE_HEADER instead of the file"
+        )
+
+
+def validate_release_vmid_ranges() -> None:
+    """No two releases may claim the same VM ID.
+
+    Each release claims `VMID_START + vmid_offset` plus one per profile, and the
+    offsets are packed tight: Debian takes +0..3 and Ubuntu +4..7 for today's
+    four profiles. So adding a fifth profile makes Debian claim Ubuntu's first
+    ID. Proxmox shares one ID space across the cluster and `qm create` on a
+    taken ID fails late, on a node, after an image download, so catch it here.
+    """
+    claimed: dict[int, str] = {}
+    for name, release in sorted(RELEASES.items()):
+        for profile in PROFILES:
+            vmid = int(CONFIG["VMID_START"]) + release.vmid_offset + profile.vmid_offset
+            owner = f"{name}/{profile.name}"
+            if vmid in claimed:
+                errors.append(
+                    f"VM ID {vmid} is claimed by both {claimed[vmid]} and {owner}; "
+                    "widen a release vmid_offset in render.RELEASES"
+                )
+            else:
+                claimed[vmid] = owner
 
 
 def validate_generated_bundle(release: str) -> None:
@@ -1793,9 +1981,10 @@ def validate_generated_bundle(release: str) -> None:
             vendor=vendor,
             image=image,
             public_key=TEST_SSH_PUBLIC_KEY,
+            release=release,
         )
         try:
-            validate_generated_command(vendor, command)
+            validate_generated_command(vendor, command, release)
         except SystemExit as error:
             errors.append(f"{vendor.template_name}: {error}")
 
@@ -1910,7 +2099,7 @@ def main() -> int:
     parser.add_argument(
         "--release",
         default=DEFAULT_RELEASE,
-        help=f"Debian release directory under templates/ (default: {DEFAULT_RELEASE})",
+        help=f"OS release directory under templates/ (default: {DEFAULT_RELEASE})",
     )
     parser.add_argument(
         "--full",
@@ -1919,6 +2108,7 @@ def main() -> int:
     )
     arguments = parser.parse_args()
 
+    release_info = load_release(arguments.release)
     image = load_image(arguments.release)
     rendered: dict[str, str] = {}
 
@@ -1926,7 +2116,10 @@ def main() -> int:
         content = render(
             profile,
             arguments.release,
-            DEBIAN_IMAGE_BUILD=image.build,
+            OS=image.os,
+            OS_VERSION=image.version,
+            OS_CODENAME=image.codename,
+            IMAGE_BUILD=image.build,
             **STUB_PROVENANCE,
         )
         rendered[profile.name] = content
@@ -1939,47 +2132,50 @@ def main() -> int:
             report(profile.name, "rendered config is not a mapping")
             continue
 
-        validate_common(profile, document, content)
+        validate_common(profile, document, content, arguments.release)
         validate_ssh_source_restriction(profile, document)
         validate_strict_rp_filter(profile, document)
-        validate_image_release(profile, document)
+        validate_image_release(profile, document, arguments.release)
         validate_var_log_persistence(profile, document)
         validate_rsyslog(profile, document)
-        validate_remote_syslog(profile, document)
+        validate_remote_syslog(profile, document, arguments.release)
         validate_appdata(profile, document)
-        validate_docker_rootless(profile, document)
+        validate_docker_rootless(profile, document, arguments.release)
+        validate_release_specific(profile, document, content, arguments.release)
         validate_ssh_user_ca(profile, document)
         validate_ca_certs(profile, document)
         validate_no_secrets(profile, content, exempt_ca_key=True)
 
-    containers = lxc_artifacts(
-        arguments.release, dict(STUB_PROVENANCE), TEST_SSH_PUBLIC_KEY
-    )
-    for profile, container in zip(PROFILES, containers):
-        bootstrap = container.bootstrap
-        validate_lxc_ssh(profile, bootstrap)
-        validate_lxc_sysctl(profile, bootstrap)
-        validate_lxc_packages(profile, bootstrap)
-        validate_lxc_logging(profile, bootstrap)
-        validate_lxc_var_log(profile, bootstrap)
-        validate_lxc_appdata(profile, bootstrap)
-        validate_lxc_host_keys(profile, bootstrap)
-        validate_lxc_omissions(profile, bootstrap)
-        validate_lxc_fail2ban(profile, bootstrap)
-        validate_lxc_docker(profile, bootstrap)
-        validate_lxc_idempotence(profile, bootstrap)
-        validate_lxc_provenance(profile, bootstrap)
-        validate_lxc_features(profile, container.command)
-        # The create script legitimately carries the operator's public keys. The
-        # bootstrap carries the CA public key -- a trust anchor, not a credential -- and
-        # must carry no other key material.
-        validate_no_secrets(profile, bootstrap, exempt_ca_key=True)
+    if release_info.lxc:
+        containers = lxc_artifacts(
+            arguments.release, dict(STUB_PROVENANCE), TEST_SSH_PUBLIC_KEY
+        )
+        for profile, container in zip(PROFILES, containers):
+            bootstrap = container.bootstrap
+            validate_lxc_ssh(profile, bootstrap)
+            validate_lxc_sysctl(profile, bootstrap)
+            validate_lxc_packages(profile, bootstrap)
+            validate_lxc_logging(profile, bootstrap)
+            validate_lxc_var_log(profile, bootstrap)
+            validate_lxc_appdata(profile, bootstrap)
+            validate_lxc_host_keys(profile, bootstrap)
+            validate_lxc_omissions(profile, bootstrap)
+            validate_lxc_fail2ban(profile, bootstrap)
+            validate_lxc_docker(profile, bootstrap)
+            validate_lxc_idempotence(profile, bootstrap)
+            validate_lxc_provenance(profile, bootstrap)
+            validate_lxc_features(profile, container.command)
+            validate_no_secrets(profile, bootstrap, exempt_ca_key=True)
 
     validate_writer_boundary()
-    validate_manifest_matches_config()
-    validate_lxc_artifact_names(arguments.release)
+    validate_manifest_matches_config(arguments.release)
+    validate_image_pin_is_updater_output(arguments.release)
+    validate_release_vmid_ranges()
+    if release_info.lxc:
+        validate_lxc_artifact_names(arguments.release)
     validate_generated_bundle(arguments.release)
-    validate_generated_lxc_bundle(arguments.release)
+    if release_info.lxc:
+        validate_generated_lxc_bundle(arguments.release)
 
     if arguments.full and not errors:
         run_full_checks(rendered)

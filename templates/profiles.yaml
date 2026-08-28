@@ -15,25 +15,25 @@
 
 profiles:
   - name: base
-    description: Hardened Debian agent host
+    description: Hardened KASA agent host
     vmid_offset: 0
     flags:
       - remote_syslog
 
   - name: docker
-    description: Hardened Debian agent host with Docker
+    description: Hardened KASA agent host with Docker
     vmid_offset: 1
     flags:
       - docker
       - remote_syslog
 
   - name: base-local
-    description: Hardened Debian agent host with durable local logging
+    description: Hardened KASA agent host with durable local logging
     vmid_offset: 2
     flags: []
 
   - name: docker-local
-    description: Hardened Debian agent host with Docker and durable local logging
+    description: Hardened KASA agent host with Docker and durable local logging
     vmid_offset: 3
     flags:
       - docker

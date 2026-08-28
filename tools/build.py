@@ -33,6 +33,7 @@ from render import (
     expand_template,
     load_image,
     load_lxc_template,
+    load_release,
     lxc_template_name,
     profile_flags,
     render,
@@ -138,6 +139,7 @@ def render_command(
     vendor: VendorArtifact,
     image: Image,
     public_key: str,
+    release: str = DEFAULT_RELEASE,
 ) -> str:
     """Render one VM's Proxmox creation script.
 
@@ -165,12 +167,14 @@ def render_command(
         "@@VENDOR_SHA256@@": vendor.digest,
         "@@SSH_PUBLIC_KEY@@": public_key,
         "@@IMAGE_NAME@@": image.name,
-        "@@IMAGE_SHA512@@": image.sha512,
+        "@@IMAGE_CHECKSUM_ALGORITHM@@": image.checksum_algorithm,
+        "@@IMAGE_CHECKSUM@@": image.checksum,
         "@@IMAGE_URL@@": image.url,
     }
     quoted = {marker: shlex.quote(value) for marker, value in replacements.items()}
+    flags = {**profile_flags(profile), "uefi": load_release(release).uefi}
     try:
-        return expand_template(COMMAND_TEMPLATE, profile_flags(profile), quoted)
+        return expand_template(COMMAND_TEMPLATE, flags, quoted)
     except ValueError as error:
         fail(f"Proxmox command template: {error}")
 
@@ -317,7 +321,9 @@ def validate_injected_keys(label: str, script: str) -> None:
                 )
 
 
-def validate_generated_command(vendor: VendorArtifact, command: str) -> None:
+def validate_generated_command(
+    vendor: VendorArtifact, command: str, release: str = DEFAULT_RELEASE
+) -> None:
     appdata_volume = (
         "${VM_STORAGE_NAME}:${APPDATA_DISK_SIZE},"
         "ssd=1,discard=on,iothread=1,backup=1,"
@@ -341,6 +347,18 @@ def validate_generated_command(vendor: VendorArtifact, command: str) -> None:
     if "the VM remains running afterward" not in command:
         fail("generated Proxmox command must describe first-boot running state")
 
+    for fragment in (
+        "sha256) image_checksum_command=sha256sum",
+        "sha512) image_checksum_command=sha512sum",
+        'require_command "$image_checksum_command"',
+        '"$IMAGE_CHECKSUM" "$image_temp" | "$image_checksum_command" --check -',
+        '"$IMAGE_CHECKSUM" "$image_path" | "$image_checksum_command" --check -',
+    ):
+        if fragment not in command:
+            fail(f"generated Proxmox command is missing image verification: {fragment}")
+    if re.search(r"^\s*eval\b", command, re.MULTILINE):
+        fail("generated Proxmox command must not eval a checksum command")
+
     # The NIC is one line of shell, and getting it wrong is silent: a template on a
     # trunk bridge with no tag comes up with a link and no network, which looks like a
     # cloud-init failure rather than a missing option.
@@ -351,19 +369,39 @@ def validate_generated_command(vendor: VendorArtifact, command: str) -> None:
     if "tag=${VLAN_TAG}" not in command:
         fail("generated Proxmox command must tag the NIC when a VLAN is configured")
 
-    # UEFI, and the EFI variable store it needs. A template booted through OVMF without
-    # an efidisk0 keeps its boot entries nowhere, so it survives the build and fails on
-    # the first clone that reboots.
-    if "--bios ovmf" not in command:
-        fail("generated Proxmox command must boot the template through OVMF")
-    if "seabios" in command:
-        fail("generated Proxmox command must not select the legacy BIOS")
-    if command.count("--efidisk0") != 1:
-        fail("generated Proxmox command must attach exactly one EFI disk")
-    if "efitype=4m" not in command:
-        fail("generated Proxmox command must use the 4m EFI variable store")
-    if "pre-enrolled-keys=1" not in command:
-        fail("generated Proxmox command must enrol the Secure Boot keys")
+    # q35 either way. It is the PCIe machine type, which the firmware choice does
+    # not change, and dropping to i440fx would silently remove PCIe from every
+    # guest that later needs a passed-through device.
+    if "--machine q35" not in command:
+        fail("generated Proxmox command must use the q35 machine type")
+
+    if load_release(release).uefi:
+        # UEFI, and the EFI variable store it needs. A template booted through OVMF
+        # without an efidisk0 keeps its boot entries nowhere, so it survives the build
+        # and fails on the first clone that reboots.
+        if "--bios ovmf" not in command:
+            fail("generated Proxmox command must boot the template through OVMF")
+        if "seabios" in command:
+            fail("generated Proxmox command must not select the legacy BIOS")
+        if command.count("--efidisk0") != 1:
+            fail("generated Proxmox command must attach exactly one EFI disk")
+        if "efitype=4m" not in command:
+            fail("generated Proxmox command must use the 4m EFI variable store")
+        if "pre-enrolled-keys=1" not in command:
+            fail("generated Proxmox command must enrol the Secure Boot keys")
+    else:
+        # A legacy-BIOS release must carry no EFI remnant. An efidisk0 alongside
+        # --bios seabios is dead storage the guest never reads, and a stray
+        # pre-enrolled-keys would read as Secure Boot to anyone auditing the script.
+        if "--bios seabios" not in command:
+            fail("generated Proxmox command must boot the template through SeaBIOS")
+        if "ovmf" in command:
+            fail("generated Proxmox command must not select OVMF")
+        if "--efidisk0" in command:
+            fail("a legacy-BIOS template must not attach an EFI variable store")
+        for remnant in ("efitype=", "pre-enrolled-keys="):
+            if remnant in command:
+                fail(f"legacy-BIOS template carries an EFI remnant: {remnant}")
 
     validate_injected_keys(f"{vendor.template_name} create script", command)
 
@@ -518,7 +556,10 @@ def build_vendor(profile: Profile, release: str, provenance: dict[str, str]) -> 
     return render(
         profile,
         release,
-        DEBIAN_IMAGE_BUILD=image.build,
+        OS=image.os,
+        OS_VERSION=image.version,
+        OS_CODENAME=image.codename,
+        IMAGE_BUILD=image.build,
         **provenance,
     )
 
@@ -571,7 +612,7 @@ def lxc_artifacts(
 
 
 def vendor_artifacts(release: str, provenance: dict[str, str]) -> tuple[VendorArtifact, ...]:
-    vmid_start = int(CONFIG["VMID_START"])
+    vmid_start = int(CONFIG["VMID_START"]) + load_release(release).vmid_offset
     prefix = CONFIG["NAME_PREFIX"]
     artifacts: list[VendorArtifact] = []
     for profile in PROFILES:
@@ -590,6 +631,7 @@ def vendor_artifacts(release: str, provenance: dict[str, str]) -> tuple[VendorAr
 
 
 def build(release: str) -> None:
+    release_info = load_release(release)
     if "KASA_ENV_FILE" not in os.environ and not LOCAL_CONFIG.is_file():
         fail("copy tools/env.example to tools/.env and edit it first")
     if PRIVATE_SOURCE_MARKER.is_file() and not SSH_ALLOW_USERS:
@@ -601,7 +643,7 @@ def build(release: str) -> None:
         if not shutil.which(command):
             fail(f"required local command is missing: {command}")
 
-    run([sys.executable, str(ROOT / "tools" / "validate.py")])
+    run([sys.executable, str(ROOT / "tools" / "validate.py"), "--release", release])
 
     image = load_image(release)
     public_key = read_public_keys()
@@ -619,18 +661,24 @@ def build(release: str) -> None:
         (
             f"create-{vendor.template_name}.sh",
             render_command(
-                profile=profile, vendor=vendor, image=image, public_key=public_key
+                profile=profile,
+                vendor=vendor,
+                image=image,
+                public_key=public_key,
+                release=release,
             ),
             vendor,
         )
         for profile, vendor in zip(PROFILES, vendors)
     )
     for _, command, vendor in commands:
-        validate_generated_command(vendor, command)
+        validate_generated_command(vendor, command, release)
 
-    containers = lxc_artifacts(release, provenance, public_key)
-    for profile, container in zip(PROFILES, containers):
-        validate_generated_lxc(profile, container)
+    containers: tuple[LxcArtifact, ...] = ()
+    if release_info.lxc:
+        containers = lxc_artifacts(release, provenance, public_key)
+        for profile, container in zip(PROFILES, containers):
+            validate_generated_lxc(profile, container)
 
     output_directory = prepare_output_directory()
 
@@ -681,19 +729,20 @@ def build(release: str) -> None:
         print(f"  bash {command_name}")
     print("Add --replace to rebuild over an existing template.")
 
-    print(f"\nBuilt LXC bundle for {release} ({load_lxc_template(release).template})")
-    for path in lxc_paths:
-        print(path)
-    print(
-        "Copy each create script and its matching bootstrap to a Proxmox node, "
-        "keeping the pair in the same directory, then run any one of these:"
-    )
-    for container in containers:
-        print(f"  bash {container.command_filename}   # container {container.ctid}")
-    print(
-        "Each script creates and starts its container, then prints the pct exec "
-        "command that completes it."
-    )
+    if release_info.lxc:
+        print(f"\nBuilt LXC bundle for {release} ({load_lxc_template(release).template})")
+        for path in lxc_paths:
+            print(path)
+        print(
+            "Copy each create script and its matching bootstrap to a Proxmox node, "
+            "keeping the pair in the same directory, then run any one of these:"
+        )
+        for container in containers:
+            print(f"  bash {container.command_filename}   # container {container.ctid}")
+        print(
+            "Each script creates and starts its container, then prints the pct exec "
+            "command that completes it."
+        )
 
 
 def main() -> int:
@@ -701,7 +750,7 @@ def main() -> int:
     parser.add_argument(
         "--release",
         default=DEFAULT_RELEASE,
-        help=f"Debian release directory under templates/ (default: {DEFAULT_RELEASE})",
+        help=f"OS release directory under templates/ (default: {DEFAULT_RELEASE})",
     )
     arguments = parser.parse_args()
     build(arguments.release)

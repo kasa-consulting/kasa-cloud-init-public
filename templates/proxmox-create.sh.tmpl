@@ -25,7 +25,8 @@ SSH_PUBLIC_KEY=@@SSH_PUBLIC_KEY@@
 #% endif
 
 IMAGE_NAME=@@IMAGE_NAME@@
-IMAGE_SHA512=@@IMAGE_SHA512@@
+IMAGE_CHECKSUM_ALGORITHM=@@IMAGE_CHECKSUM_ALGORITHM@@
+IMAGE_CHECKSUM=@@IMAGE_CHECKSUM@@
 IMAGE_URL=@@IMAGE_URL@@
 
 replace=0
@@ -60,9 +61,15 @@ require_command() {
 }
 
 [ "$(id -u)" -eq 0 ] || fail "Run these commands as root on Proxmox"
-for command in awk curl mktemp mv pvesm qm sha256sum sha512sum ssh-keygen; do
+for command in awk curl mktemp mv pvesm qm sha256sum ssh-keygen; do
   require_command "$command"
 done
+case "$IMAGE_CHECKSUM_ALGORITHM" in
+  sha256) image_checksum_command=sha256sum ;;
+  sha512) image_checksum_command=sha512sum ;;
+  *) fail "Unsupported image checksum algorithm: $IMAGE_CHECKSUM_ALGORITHM" ;;
+esac
+require_command "$image_checksum_command"
 
 [ -d "$ISO_STORAGE_PATH" ] || \
   fail "Proxmox ISO directory is missing: $ISO_STORAGE_PATH"
@@ -147,12 +154,12 @@ if [ ! -e "$image_path" ]; then
   image_temp="$(mktemp --tmpdir="$ISO_STORAGE_PATH" ".${IMAGE_NAME}.XXXXXX")"
   curl --fail --location --proto '=https' --tlsv1.2 --retry 5 \
     --output "$image_temp" "$IMAGE_URL"
-  printf '%s  %s\n' "$IMAGE_SHA512" "$image_temp" | sha512sum --check -
+  printf '%s  %s\n' "$IMAGE_CHECKSUM" "$image_temp" | "$image_checksum_command" --check -
   chmod 0644 "$image_temp"
   mv --no-clobber -- "$image_temp" "$image_path"
   [ -e "$image_temp" ] || image_temp=""
 fi
-printf '%s  %s\n' "$IMAGE_SHA512" "$image_path" | sha512sum --check -
+printf '%s  %s\n' "$IMAGE_CHECKSUM" "$image_path" | "$image_checksum_command" --check -
 
 #% if ssh_public_key
 # Proxmox reads the keys from a file and folds them into the user-data it
@@ -184,9 +191,15 @@ create_template() {
     --balloon "$MEM_MIN" \
     --net0 "$net0" \
     --scsihw virtio-scsi-single \
+#% if uefi
     --machine q35 \
     --bios ovmf \
     --efidisk0 "${VM_STORAGE_NAME}:1,efitype=4m,pre-enrolled-keys=1" \
+#% endif
+#% if not uefi
+    --machine q35 \
+    --bios seabios \
+#% endif
     --serial0 socket \
     --vga serial0 \
     --cicustom "vendor=${vendor_volume}" \

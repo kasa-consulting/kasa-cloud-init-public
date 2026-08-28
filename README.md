@@ -1,7 +1,7 @@
 # KASA agent base images
 
-Hardened Debian 13 bootstrap artifacts for Proxmox, built on years of deployment
-and testing. They are the base for KASA services and agent hosts: pick a profile
+Hardened Debian 13 and Ubuntu 24.04 LTS VM templates for Proxmox. Debian 13 also
+ships LXC bootstraps. They are the base for KASA services and agent hosts. Pick a profile
 to get a locked-down machine that logs either to your remote collector or its
 local disk and, optionally, runs Docker.
 
@@ -15,8 +15,10 @@ Everything below describes the VM templates unless it says otherwise. The
 container profiles share the same SSH, logging, fail2ban and `rp_filter` policy,
 and differ where a container genuinely differs from a VM.
 
-The images include fail2ban, zram, and automatic root-volume growth. Expand a
-volume in the Proxmox GUI, reboot the VM, and the partition grows automatically.
+The images include fail2ban and automatic root-volume growth. Debian uses zram;
+Ubuntu deliberately has no swap because Noble's cloud `linux-virtual` kernel
+does not provide the zram module. Expand a volume in the Proxmox GUI, reboot the
+VM, and the partition grows automatically.
 
 | Template | Rootless Docker | APPDATA disk | Remote syslog |
 | --- | --- | --- | --- |
@@ -24,6 +26,10 @@ volume in the Proxmox GUI, reboot the VM, and the partition grows automatically.
 | `kasa-deb13-docker-syslog` | Yes | Yes | Always |
 | `kasa-deb13-base` | No | Yes | No; durable local logs |
 | `kasa-deb13-docker` | Yes | Yes | No; durable local logs |
+| `kasa-ubuntu24-base-syslog` | No | Yes | Always |
+| `kasa-ubuntu24-docker-syslog` | Yes | Yes | Always |
+| `kasa-ubuntu24-base` | No | Yes | No; durable local logs |
+| `kasa-ubuntu24-docker` | Yes | Yes | No; durable local logs |
 
 Things to understand before you use these, both deliberate:
 
@@ -36,12 +42,11 @@ Things to understand before you use these, both deliberate:
 > VM disks. See [Logging modes](#logging-modes).
 
 > **Rootless Docker depends on unprivileged user namespaces.**
-> Debian 13 leaves them open by default, unlike Ubuntu 24.04 and later. That is
-> a real local-privilege-escalation surface and it is the price of not running a
-> root daemon. Never add a `user.max_user_namespaces` or
-> `kernel.apparmor_restrict_unprivileged_userns` restriction to the hardening
-> sysctls; it would break Docker on this image. Keep in mind that rootless
-> Docker cannot publish ports below 1024.
+> Debian 13 leaves them open. Ubuntu 24.04 keeps its AppArmor restriction enabled
+> and uses the packaged RootlessKit profile supplied by the supported Docker
+> installation. Never set `user.max_user_namespaces=0`, disable AppArmor, or set
+> `kernel.apparmor_restrict_unprivileged_userns=0`. Rootless Docker cannot publish
+> ports below 1024 on either release.
 
 > The published template has no active `AllowUsers` directive. Public-key-only
 > authentication, disabled root login, `MaxAuthTries 3`, and
@@ -82,9 +87,10 @@ bootstrap rather than a missing tag. `LXC_VLAN_TAG` is the container counterpart
 and is set separately.
 
 ```bash
-./tools/validate.sh          # structure and content checks
-./tools/validate.sh --full   # also runs cloud-init, rsyslogd, yamllint, shellcheck
-./tools/build.sh             # builds the template files and install scripts
+./tools/validate.sh --full --release deb13
+./tools/validate.sh --full --release ubuntu24
+./tools/build.sh --release deb13
+./tools/build.sh --release ubuntu24
 ```
 
 `build/` will create one `*-vendor.yml` and one `create-*.sh` per profile. Each
@@ -111,26 +117,39 @@ bash create-kasa-deb13-docker-syslog.sh
 For durable local logging, use `create-kasa-deb13-base.sh` or
 `create-kasa-deb13-docker.sh` instead.
 
-Each template boots through UEFI with Secure Boot enforced: the script sets
-`bios: ovmf` on a `q35` machine and attaches a 4 MB EFI variable store as
-`efidisk0` with Microsoft's keys enrolled. The pinned Debian cloud image is
-hybrid-bootable and ships a signed shim and grub, so nothing inside the guest
-changes. Enforcing it also puts the kernel in lockdown `integrity`, which blocks
-unsigned module loading, `/dev/mem` and kexec.
+Ubuntu uses the same names with `ubuntu24` in place of `deb13`. Debian occupies
+`VMID_START +0..3`; Ubuntu occupies `VMID_START +4..7`, so both releases can
+exist on one Proxmox cluster. The build fails if the two ranges ever overlap.
 
-Two limits worth stating plainly. Debian does not sign the initramfs here, so
-this is not a complete boot-integrity story — a guest-root attacker can still
+Firmware differs by release, and both run on a `q35` machine.
+
+**Debian 13 boots through UEFI with Secure Boot enforced.** The script sets
+`bios: ovmf` and attaches a 4 MB EFI variable store as `efidisk0` with
+Microsoft's keys enrolled. The pinned image ships a signed shim, grub, and
+kernel. Enforcing Secure Boot also puts the kernel in lockdown `integrity`,
+which blocks unsigned module loading, `/dev/mem` and kexec.
+
+Two limits worth stating plainly. The template does not use a signed unified
+kernel image, so this is not a complete boot-integrity story. A guest-root attacker can still
 persist through `/boot/initrd.img`. And no vTPM is attached, so nothing consumes
 the boot measurements. Treat it as hardening, not attestation.
 
-If a guest needs an out-of-tree kernel module it will fail to load. Give that one
-clone its own unenforced variable store rather than weakening the template:
+**Ubuntu 24.04 boots legacy BIOS.** `bios: seabios`, no EFI variable store, no
+Secure Boot. Do not describe these templates as Secure Boot hardened. The
+deliberate consequence is that the kernel is not in lockdown, so a guest that
+needs an unsigned out-of-tree module loads it without MOK enrollment. An NVIDIA
+driver for a passed-through GPU is the usual case. The pinned Canonical
+image is hybrid-bootable and carries the bios_grub partition this needs.
+
+On Debian, a guest that needs an out-of-tree kernel module will fail to load it.
+Give that one clone its own unenforced variable store rather than weakening the
+template. Ubuntu guests need no such workaround:
 
 ```bash
 qm set VMID --efidisk0 STORAGE:1,efitype=4m,pre-enrolled-keys=0
 ```
 
-Each script downloads and verifies the Debian image, checks the VM ID is free,
+Each script downloads and verifies its pinned OS image, checks the VM ID is free,
 and creates the template. Boot it once: a successful first boot leaves the VM
 running; a failed bootstrap writes diagnostics to the `~/logs` folder.
 Keep the snippets available to Proxmox so the cloud-init drive can be
@@ -149,6 +168,7 @@ rebuilding. The script reports this case explicitly rather than half-completing.
 | `tools/.env` | Your local settings, copied from `tools/env.example`. Gitignored. **Create this first.** |
 | `templates/profiles.yaml` | Which profiles get built, and their flags. One manifest drives both VMs and containers. |
 | `templates/deb13/` | The cloud-config template, the LXC bootstrap template, the Debian image pin, and the container template pin. |
+| `templates/ubuntu24/` | The Ubuntu cloud-config template and immutable Canonical image pin. Ubuntu is VM-only. |
 | `templates/proxmox-create.sh.tmpl` | The `qm create` script emitted per VM template. |
 | `templates/proxmox-lxc-create.sh.tmpl` | The `pct create` script emitted per container profile. |
 | `tools/build.sh` | Build command. The only thing that writes artifacts. |
@@ -163,6 +183,9 @@ rebuilding. The script reports this case explicitly rather than half-completing.
   build and SHA512, and `lxc-template.yaml`, pinning its container template.
   The container pin carries no checksum: container templates come from Proxmox's
   signed appliance catalogue, so `pveam` already owns that trust path.
+- `templates/ubuntu24/` holds a separate cloud-config and the official Canonical
+  Noble amd64 server image pinned by versioned URL and SHA256. The templates stay
+  separate because Ubuntu's AppArmor, package, sysctl, and systemd behavior differs.
 
 
 There is deliberately no template versioning. Template names are stable and
@@ -171,22 +194,33 @@ Provenance lives inside the guest instead, in `/etc/kasa-image-release`:
 
 ```
 ID=docker
-DESCRIPTION=Hardened Debian agent host with Docker
+DESCRIPTION=Hardened KASA agent host with Docker
 RELEASE=deb13
-DEBIAN_IMAGE_BUILD=20260722-2547
+OS=debian
+OS_VERSION=13
+OS_CODENAME=trixie
+IMAGE_BUILD=20260722-2547
 SOURCE_COMMIT=1f3c0c1e...
 SOURCE_TREE_DIRTY=false
 BUILT_AT=2026-08-05T20:14:03+00:00
 ```
+
+Image pins use one schema with OS identity, immutable build, exact filename,
+official HTTPS URL, checksum algorithm, and digest. Debian 13 uses a versioned
+GenericCloud qcow2 from `cloud.debian.org` with SHA512. Ubuntu 24.04 uses
+Canonical's versioned Noble amd64 server `.img` from
+`cloud-images.ubuntu.com` with SHA256. The shared Proxmox script selects the
+declared checksum command from a fixed allowlist and verifies cached images too.
 
 ## What is in the images
 
 ### Packages
 
 Every template installs `ca-certificates`, `cloud-guest-utils`, `fail2ban`,
-`nftables`, `openssh-server`, `qemu-guest-agent`, `rsyslog`, `sudo`,
-`systemd-zram-generator`, and `unattended-upgrades`. First boot runs a full
-update and upgrade before anything else is configured.
+`nftables`, `openssh-server`, `qemu-guest-agent`, `rsyslog`, `sudo`, and
+`unattended-upgrades`. Debian also installs `systemd-zram-generator`; Ubuntu
+installs `apparmor` explicitly. First boot runs a full update and upgrade before
+anything else is configured.
 
 There are no language runtimes, build tools, or agent software. This is a base
 image; agent payloads layer on top of a clone.
@@ -256,17 +290,17 @@ or only for rootless Docker. See
 | SSH | Public key only for `admin`; no root; optional exact source restriction from `SSH_ALLOW_USERS` in `tools/.env`; `MaxAuthTries 3`; `LoginGraceTime 30s` | `/etc/ssh/sshd_config.d/99-harden.conf` |
 | fail2ban | Aggressive `sshd` jail, escalating 30m bans, nftables actions | `/etc/fail2ban/jail.local` |
 | Kernel | Restricted kptr and ptrace, unprivileged BPF off, redirects off, strict `rp_filter = 1`, SYN cookies | `/etc/sysctl.d/60-hardening.conf` |
-| Updates | Debian unattended-upgrades defaults, enabled daily with no automatic reboot | `/etc/apt/apt.conf.d/20auto-upgrades` |
-| Swap | zram only, `min(ram / 2, 512)` with zstd, `vm.swappiness = 100` | `/etc/systemd/zram-generator.conf` |
+| Updates | Distribution unattended-upgrades policy, enabled daily with no automatic reboot | `/etc/apt/apt.conf.d/20auto-upgrades` |
+| Swap | Debian: zram only, `min(ram / 2, 512)` with zstd and `vm.swappiness = 100`; Ubuntu: none | Debian: `/etc/systemd/zram-generator.conf` |
 | Disk | Root grows on first boot, `fstrim.timer` enabled | cloud-init `growpart` |
 | Remote syslog | Volatile journal forwarded to `SYSLOG_SERVER:SYSLOG_PORT` over plain TCP, memory-only queue | `/etc/rsyslog.d/01-remote.conf` |
-| Local logging | profiles without `-syslog` use normal disk-backed rsyslog files and persistent fail2ban state | Debian package defaults |
-| `/var/log` | Persistent on every profile; never a tmpfs, so package-created log directories survive a reboot | Debian package defaults |
+| Local logging | profiles without `-syslog` use normal disk-backed rsyslog files and persistent fail2ban state | Distribution package defaults |
+| `/var/log` | Persistent on every profile; never a tmpfs, so package-created log directories survive a reboot | Distribution package defaults |
 | Docker | Rootless, `data-root` on `/mnt/appdata/docker`, journald log driver | `~admin/.config/docker/daemon.json` |
 | APPDATA | Every VM gets a disk matched by WWN and serial, ext4 labelled `APPDATA`, mounted at `/mnt/appdata` | `bootcmd`, `appdata-verify.service` |
 | First boot | Self-checks the bootstrap and remains running; failures write `/home/admin/logs/` | `cloud-init-post-verify.service` |
 
-`templates/deb13/cloud-config.yml.tmpl` owns the public-safe base;
+Each release's `cloud-config.yml.tmpl` owns its public-safe base;
 `SSH_ALLOW_USERS` in `tools/.env` owns optional private SSH source entries.
 
 The SSH source policy uses OpenSSH's additive
@@ -285,6 +319,17 @@ The daemon runs as `admin` through a systemd user service, started at boot by
 lingering. The rootful `docker.service` and `docker.socket` are masked before
 the packages install, so the root daemon never runs and `/var/lib/docker` is
 never created — first boot fails if it finds one.
+
+Docker packages come from the matching official repository. Debian uses
+`download.docker.com/linux/debian` with suite `trixie`; Ubuntu uses
+`download.docker.com/linux/ubuntu` with suite `noble`. Ubuntu installs and loads
+the packaged `/etc/apparmor.d/rootlesskit` AppArmor profile while leaving the system-wide
+unprivileged-user-namespace restriction enabled.
+
+Noble also runs rsyslog as the `syslog` account under AppArmor. Remote-logging
+profiles grant that daemon only the journal-tree reads and volatile
+`/run/rsyslog` cursor access it needs. The exception is local to rsyslog's
+profile; AppArmor remains enforced.
 
 Consequences worth knowing:
 
@@ -308,10 +353,10 @@ delegates the cgroup controllers that rootless mode otherwise cannot use.
 
 ### Logging modes
 
-The profiles without `-syslog` use Debian's normal logging behavior: rsyslog writes to
+The profiles without `-syslog` use the distribution's normal logging behavior: rsyslog writes to
 disk under `/var/log`, fail2ban keeps its database under `/var/lib/fail2ban`,
 and no remote collector is configured or tested. Standard log rotation remains
-owned by the Debian packages.
+owned by the OS packages.
 
 The `-syslog` profiles deliberately keep their *system* logging state in memory
 and send it to the collector instead.
@@ -342,7 +387,9 @@ otherwise run blind.
 
 ## LXC containers
 
-The same four profiles also build Proxmox LXC containers. A container is not a
+Debian 13 builds the same four profiles as Proxmox LXC containers. Ubuntu 24.04
+LXC is not included in this release. The Proxmox appliance exists, but its
+distro-specific bootstrap and runtime acceptance remain follow-up work. A container is not a
 small VM, so these are not the cloud-config translated into shell: the profile
 semantics are shared, and every mechanism that only makes sense for a VM is
 replaced or dropped deliberately.
@@ -371,7 +418,7 @@ A container shares the host kernel, so several VM controls move to Proxmox:
 
 | Concern | VM | LXC |
 | --- | --- | --- |
-| Memory and swap | zram inside the guest | `pct --memory` / `--swap` on the host |
+| Memory and swap | Debian uses guest zram; Ubuntu has no swap | `pct --memory` / `--swap` on the host |
 | Discard / trim | guest `fstrim.timer` | the backing storage's concern |
 | `kernel.*`, `fs.*`, `vm.*` sysctls | set in the guest | **host-owned**; read-only in a container |
 | APPDATA | raw disk matched by WWN and serial, formatted by the guest | Proxmox-managed `mp0` volume |
@@ -608,7 +655,7 @@ Provenance lands in `/etc/kasa-lxc-release`:
 
 ```text
 ID=docker
-DESCRIPTION=Hardened Debian agent host with Docker
+DESCRIPTION=Hardened KASA agent host with Docker
 RELEASE=deb13
 EXPECTED_LXC_TEMPLATE=debian-13-standard_13.6-1_amd64.tar.zst
 DOCKER=yes

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render the agent cloud-init profiles from one template per Debian release."""
+"""Render agent cloud-init profiles from one template per OS release."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import shlex
 
 import yaml
 
-from debian_image_updater import ImagePinError, load_image_pin
+from image_pin import ImagePinError, load_image_pin
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -144,11 +144,40 @@ class Profile:
 
 @dataclass(frozen=True)
 class Image:
+    os: str
+    version: str
     codename: str
     build: str
     name: str
     url: str
-    sha512: str
+    checksum_algorithm: str
+    checksum: str
+
+
+@dataclass(frozen=True)
+class Release:
+    """One OS release's identity and the artifact families it ships.
+
+    `uefi` carries the firmware decision with the release rather than the
+    profile, because it is a property of the pinned image and the operator's
+    intent for the whole release, not of the logging or Docker matrix. Both
+    pinned images are hybrid-bootable, so either firmware works; AGENTS.md
+    records why each release is set the way it is.
+    """
+
+    name: str
+    os: str
+    version: str
+    codename: str
+    vmid_offset: int
+    lxc: bool
+    uefi: bool
+
+
+RELEASES = {
+    "deb13": Release("deb13", "debian", "13", "trixie", 0, True, True),
+    "ubuntu24": Release("ubuntu24", "ubuntu", "24.04", "noble", 4, False, False),
+}
 
 
 @dataclass(frozen=True)
@@ -162,6 +191,15 @@ def template_name(profile: Profile, release: str, prefix: str) -> str:
     role = "docker" if profile.docker else "base"
     syslog_suffix = "-syslog" if profile.remote_syslog else ""
     return f"{prefix}-{release}-{role}{syslog_suffix}"
+
+
+def load_release(release: str) -> Release:
+    try:
+        return RELEASES[release]
+    except KeyError as error:
+        raise ValueError(
+            f"Unsupported release {release!r}; choose one of {sorted(RELEASES)}"
+        ) from error
 
 
 def lxc_template_name(profile: Profile, release: str, prefix: str) -> str:
@@ -281,8 +319,7 @@ def load_profiles() -> tuple[Profile, ...]:
 
 
 def load_image(release: str) -> Image:
-    if not re.fullmatch(r"[a-z0-9]{1,16}", release):
-        raise ValueError(f"Invalid release name: {release!r}")
+    release_info = load_release(release)
     image_file = TEMPLATES / release / "image.yaml"
     if not image_file.is_file():
         raise ValueError(f"Image pin is missing: {image_file}")
@@ -291,12 +328,24 @@ def load_image(release: str) -> Image:
     except ImagePinError as error:
         raise ValueError(f"{image_file}: {error}") from error
 
+    if (pin.os, pin.version, pin.codename) != (
+        release_info.os,
+        release_info.version,
+        release_info.codename,
+    ):
+        raise ValueError(
+            f"{image_file}: image identity does not match release {release}"
+        )
+
     return Image(
+        os=pin.os,
+        version=pin.version,
         codename=pin.codename,
         build=pin.build,
         name=pin.name,
         url=pin.url,
-        sha512=pin.sha512,
+        checksum_algorithm=pin.checksum_algorithm,
+        checksum=pin.checksum,
     )
 
 
@@ -307,8 +356,9 @@ def load_lxc_template(release: str) -> LxcTemplate:
     templates come from Proxmox's signed appliance catalog, so `pveam download`
     already owns that trust path; see the manifest for the full reasoning.
     """
-    if not re.fullmatch(r"[a-z0-9]{1,16}", release):
-        raise ValueError(f"Invalid release name: {release!r}")
+    release_info = load_release(release)
+    if not release_info.lxc:
+        raise ValueError(f"Release {release} does not ship LXC artifacts")
     manifest = TEMPLATES / release / LXC_TEMPLATE_MANIFEST
     if not manifest.is_file():
         raise ValueError(f"LXC template pin is missing: {manifest}")
@@ -664,10 +714,16 @@ def expand_template(
     for raw_line in template.read_text(encoding="utf-8").splitlines():
         directive = raw_line.strip()
         if directive.startswith("#% if "):
-            flag = directive.removeprefix("#% if ").strip()
+            # `not` rather than a second complementary flag. Two flags can be set
+            # inconsistently -- both true renders both arms -- and a negation
+            # cannot, so the either/or stays true by construction.
+            condition = directive.removeprefix("#% if ").strip()
+            negated = condition.startswith("not ")
+            flag = condition.removeprefix("not ").strip() if negated else condition
             if flag not in flags:
                 raise ValueError(f"Unknown template flag: {flag}")
-            active_stack.append(active_stack[-1] and flags[flag])
+            value = flags[flag] != negated
+            active_stack.append(active_stack[-1] and value)
             continue
         if directive == "#% endif":
             if len(active_stack) == 1:
@@ -753,6 +809,7 @@ def profile_flags(profile: Profile) -> dict[str, bool]:
 
 def render(profile: Profile, release: str = DEFAULT_RELEASE, **extra: str) -> str:
     """Render one profile's cloud-config in memory."""
+    load_release(release)
     replacements = {
         "@@PROFILE_NAME@@": profile.name,
         "@@PROFILE_DESCRIPTION@@": profile.description,
@@ -784,6 +841,9 @@ def render_lxc(profile: Profile, release: str = DEFAULT_RELEASE, **extra: str) -
     disk it cannot reach; leaving them out means such a template fails to render
     rather than emitting a check that can never pass.
     """
+    release_info = load_release(release)
+    if not release_info.lxc:
+        raise ValueError(f"Release {release} does not ship LXC artifacts")
     replacements = {
         "@@PROFILE_NAME@@": profile.name,
         "@@PROFILE_DESCRIPTION@@": profile.description,
