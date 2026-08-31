@@ -779,7 +779,7 @@ def validate_remote_syslog(
     if "ForwardToSyslog=no" not in journald:
         report(name, "journald must not forward to syslog; rsyslog reads the journal")
 
-    if release == "ubuntu24":
+    if load_release(release).os == "ubuntu":
         tmpfiles = files.get("/etc/tmpfiles.d/60-kasa-rsyslog.conf", {}).get(
             "content", ""
         )
@@ -943,16 +943,11 @@ def validate_docker_rootless(
     docker_source = files.get("/etc/apt/sources.list.d/docker.sources", {}).get(
         "content", ""
     )
-    expected_repository = {
-        "deb13": (
-            "URIs: https://download.docker.com/linux/debian",
-            "Suites: trixie",
-        ),
-        "ubuntu24": (
-            "URIs: https://download.docker.com/linux/ubuntu",
-            "Suites: noble",
-        ),
-    }[release]
+    release_info = load_release(release)
+    expected_repository = (
+        f"URIs: https://download.docker.com/linux/{release_info.os}",
+        f"Suites: {release_info.codename}",
+    )
     for fragment in expected_repository:
         if fragment not in docker_source:
             report(name, f"Docker repository is missing {fragment}")
@@ -960,7 +955,7 @@ def validate_docker_rootless(
     modules_load = files.get(
         "/etc/modules-load.d/60-rootless-docker.conf", {}
     ).get("content", "")
-    # nf_tables is the whole list on both releases. Ubuntu's iptables is
+    # nf_tables is the whole list on every release. Ubuntu's iptables is
     # iptables-nft, so the legacy x_tables modules would be loaded surface that
     # carries no rules.
     if modules_load.strip() != "nf_tables":
@@ -974,7 +969,7 @@ def validate_docker_rootless(
     ):
         if package not in packages:
             report(name, f"rootless Docker requires the {package} package")
-    if release == "ubuntu24" and "apparmor" not in packages:
+    if release_info.os == "ubuntu" and "apparmor" not in packages:
         report(name, "Ubuntu rootless Docker requires the apparmor package")
 
     # Rootless means rootless: the system daemon must never run.
@@ -1073,7 +1068,7 @@ def validate_docker_rootless(
         report(name, "sudo su does not set up XDG_RUNTIME_DIR for the setup tool")
     if "dockerd-rootless-setuptool.sh install" not in finalize:
         report(name, "finalize must install the rootless daemon")
-    if release == "ubuntu24":
+    if release_info.os == "ubuntu":
         for fragment in (
             "kernel.apparmor_restrict_unprivileged_userns)",
             "/etc/apparmor.d/rootlesskit",
@@ -1109,7 +1104,7 @@ def validate_release_specific(
     profile: Profile, document: dict, rendered: str, release: str
 ) -> None:
     """Validate a distro-specific mechanism for a shared security property."""
-    if release != "ubuntu24":
+    if load_release(release).os != "ubuntu":
         return
     name = profile.name
     bootcmd = "\n".join(str(command) for command in document.get("bootcmd", []))
@@ -1952,10 +1947,9 @@ def validate_release_vmid_ranges() -> None:
     """No two releases may claim the same VM ID.
 
     Each release claims `VMID_START + vmid_offset` plus one per profile, and the
-    offsets are packed tight: Debian takes +0..3 and Ubuntu +4..7 for today's
-    four profiles. So adding a fifth profile makes Debian claim Ubuntu's first
-    ID. Proxmox shares one ID space across the cluster and `qm create` on a
-    taken ID fails late, on a node, after an image download, so catch it here.
+    offsets are packed in four-ID blocks. Proxmox shares one ID space across
+    the cluster, and `qm create` on a taken ID fails late, on a node, after an
+    image download, so catch it here.
     """
     claimed: dict[int, str] = {}
     for name, release in sorted(RELEASES.items()):

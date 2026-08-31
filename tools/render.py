@@ -177,6 +177,7 @@ class Release:
 RELEASES = {
     "deb13": Release("deb13", "debian", "13", "trixie", 0, True, True),
     "ubuntu24": Release("ubuntu24", "ubuntu", "24.04", "noble", 4, False, False),
+    "ubuntu26": Release("ubuntu26", "ubuntu", "26.04", "resolute", 8, False, False),
 }
 
 

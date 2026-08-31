@@ -42,7 +42,7 @@ class ImagePolicy:
 
 
 POLICIES = {
-    "debian": ImagePolicy(
+    ("debian", "13", "trixie"): ImagePolicy(
         version="13",
         codename="trixie",
         build_re=re.compile(r"\d{8}-\d{4}"),
@@ -51,13 +51,22 @@ POLICIES = {
         path=lambda pin: f"/images/cloud/trixie/{pin.build}/{pin.name}",
         checksum_algorithm="sha512",
     ),
-    "ubuntu": ImagePolicy(
+    ("ubuntu", "24.04", "noble"): ImagePolicy(
         version="24.04",
         codename="noble",
         build_re=re.compile(r"\d{8}(?:\.\d+)?"),
         name_re=re.compile(r"ubuntu-24\.04-server-cloudimg-amd64\.img"),
         host="cloud-images.ubuntu.com",
         path=lambda pin: f"/releases/noble/release-{pin.build}/{pin.name}",
+        checksum_algorithm="sha256",
+    ),
+    ("ubuntu", "26.04", "resolute"): ImagePolicy(
+        version="26.04",
+        codename="resolute",
+        build_re=re.compile(r"\d{8}(?:\.\d+)?"),
+        name_re=re.compile(r"ubuntu-26\.04-server-cloudimg-amd64\.img"),
+        host="cloud-images.ubuntu.com",
+        path=lambda pin: f"/releases/resolute/release-{pin.build}/{pin.name}",
         checksum_algorithm="sha256",
     ),
 }
@@ -79,9 +88,14 @@ def validate_image_pin(document: dict[object, object]) -> ImagePin:
 
     values = {key: str(document[key]).strip() for key in expected}
     try:
-        policy = POLICIES[values["os"]]
+        policy = POLICIES[
+            (values["os"], values["version"], values["codename"])
+        ]
     except KeyError as error:
-        raise ImagePinError(f"unsupported image OS: {values['os']!r}") from error
+        raise ImagePinError(
+            "unsupported image release: "
+            f"{values['os']} {values['version']} {values['codename']}"
+        ) from error
     pin = ImagePin(**values)
     if pin.version != policy.version or pin.codename != policy.codename:
         raise ImagePinError(

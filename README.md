@@ -1,6 +1,6 @@
 # KASA agent base images
 
-Hardened Debian 13 and Ubuntu 24.04 LTS VM templates for Proxmox. Debian 13 also
+Hardened Debian 13, Ubuntu 24.04 LTS, and Ubuntu 26.04 LTS VM templates for Proxmox. Debian 13 also
 ships LXC bootstraps. They are the base for KASA services and agent hosts. Pick a profile
 to get a locked-down machine that logs either to your remote collector or its
 local disk and, optionally, runs Docker.
@@ -16,7 +16,7 @@ container profiles share the same SSH, logging, fail2ban and `rp_filter` policy,
 and differ where a container genuinely differs from a VM.
 
 The images include fail2ban and automatic root-volume growth. Debian uses zram;
-Ubuntu deliberately has no swap because Noble's cloud `linux-virtual` kernel
+Ubuntu deliberately has no swap because its cloud `linux-virtual` kernel
 does not provide the zram module. Expand a volume in the Proxmox GUI, reboot the
 VM, and the partition grows automatically.
 
@@ -30,6 +30,10 @@ VM, and the partition grows automatically.
 | `kasa-ubuntu24-docker-syslog` | Yes | Yes | Always |
 | `kasa-ubuntu24-base` | No | Yes | No; durable local logs |
 | `kasa-ubuntu24-docker` | Yes | Yes | No; durable local logs |
+| `kasa-ubuntu26-base-syslog` | No | Yes | Always |
+| `kasa-ubuntu26-docker-syslog` | Yes | Yes | Always |
+| `kasa-ubuntu26-base` | No | Yes | No; durable local logs |
+| `kasa-ubuntu26-docker` | Yes | Yes | No; durable local logs |
 
 Things to understand before you use these, both deliberate:
 
@@ -37,12 +41,12 @@ Things to understand before you use these, both deliberate:
 > For the templates ending in `-syslog`, the journal is volatile, the rsyslog
 > forwarding queue has no disk spool, and fail2ban's ban database lives in
 > `/run` — so the collector is the only durable copy of the system log stream.
-> `/var/log` is a normal persistent directory on all four templates. The
+> `/var/log` is a normal persistent directory on every template. The
 > profiles without `-syslog` instead keep normal durable syslog files on their
 > VM disks. See [Logging modes](#logging-modes).
 
 > **Rootless Docker depends on unprivileged user namespaces.**
-> Debian 13 leaves them open. Ubuntu 24.04 keeps its AppArmor restriction enabled
+> Debian 13 leaves them open. Ubuntu keeps its AppArmor restriction enabled
 > and uses the packaged RootlessKit profile supplied by the supported Docker
 > installation. Never set `user.max_user_namespaces=0`, disable AppArmor, or set
 > `kernel.apparmor_restrict_unprivileged_userns=0`. Rootless Docker cannot publish
@@ -89,8 +93,10 @@ and is set separately.
 ```bash
 ./tools/validate.sh --full --release deb13
 ./tools/validate.sh --full --release ubuntu24
+./tools/validate.sh --full --release ubuntu26
 ./tools/build.sh --release deb13
 ./tools/build.sh --release ubuntu24
+./tools/build.sh --release ubuntu26
 ```
 
 `build/` will create one `*-vendor.yml` and one `create-*.sh` per profile. Each
@@ -117,9 +123,9 @@ bash create-kasa-deb13-docker-syslog.sh
 For durable local logging, use `create-kasa-deb13-base.sh` or
 `create-kasa-deb13-docker.sh` instead.
 
-Ubuntu uses the same names with `ubuntu24` in place of `deb13`. Debian occupies
-`VMID_START +0..3`; Ubuntu occupies `VMID_START +4..7`, so both releases can
-exist on one Proxmox cluster. The build fails if the two ranges ever overlap.
+Ubuntu uses the same names with `ubuntu24` or `ubuntu26` in place of `deb13`.
+Debian occupies `VMID_START +0..3`, Ubuntu 24.04 occupies `+4..7`, and Ubuntu
+26.04 occupies `+8..11`. The build fails if the ranges ever overlap.
 
 Firmware differs by release, and both run on a `q35` machine.
 
@@ -134,7 +140,7 @@ kernel image, so this is not a complete boot-integrity story. A guest-root attac
 persist through `/boot/initrd.img`. And no vTPM is attached, so nothing consumes
 the boot measurements. Treat it as hardening, not attestation.
 
-**Ubuntu 24.04 boots legacy BIOS.** `bios: seabios`, no EFI variable store, no
+**Ubuntu boots legacy BIOS.** `bios: seabios`, no EFI variable store, no
 Secure Boot. Do not describe these templates as Secure Boot hardened. The
 deliberate consequence is that the kernel is not in lockdown, so a guest that
 needs an unsigned out-of-tree module loads it without MOK enrollment. An NVIDIA
@@ -168,7 +174,7 @@ rebuilding. The script reports this case explicitly rather than half-completing.
 | `tools/.env` | Your local settings, copied from `tools/env.example`. Gitignored. **Create this first.** |
 | `templates/profiles.yaml` | Which profiles get built, and their flags. One manifest drives both VMs and containers. |
 | `templates/deb13/` | The cloud-config template, the LXC bootstrap template, the Debian image pin, and the container template pin. |
-| `templates/ubuntu24/` | The Ubuntu cloud-config template and immutable Canonical image pin. Ubuntu is VM-only. |
+| `templates/ubuntu24/` and `templates/ubuntu26/` | Ubuntu cloud-config templates and immutable Canonical image pins. Ubuntu is VM-only. |
 | `templates/proxmox-create.sh.tmpl` | The `qm create` script emitted per VM template. |
 | `templates/proxmox-lxc-create.sh.tmpl` | The `pct create` script emitted per container profile. |
 | `tools/build.sh` | Build command. The only thing that writes artifacts. |
@@ -183,8 +189,8 @@ rebuilding. The script reports this case explicitly rather than half-completing.
   build and SHA512, and `lxc-template.yaml`, pinning its container template.
   The container pin carries no checksum: container templates come from Proxmox's
   signed appliance catalogue, so `pveam` already owns that trust path.
-- `templates/ubuntu24/` holds a separate cloud-config and the official Canonical
-  Noble amd64 server image pinned by versioned URL and SHA256. The templates stay
+- Each Ubuntu directory holds a separate cloud-config and the official Canonical
+  amd64 server image pinned by versioned URL and SHA256. The templates stay
   separate because Ubuntu's AppArmor, package, sysctl, and systemd behavior differs.
 
 
@@ -207,8 +213,8 @@ BUILT_AT=2026-08-05T20:14:03+00:00
 
 Image pins use one schema with OS identity, immutable build, exact filename,
 official HTTPS URL, checksum algorithm, and digest. Debian 13 uses a versioned
-GenericCloud qcow2 from `cloud.debian.org` with SHA512. Ubuntu 24.04 uses
-Canonical's versioned Noble amd64 server `.img` from
+GenericCloud qcow2 from `cloud.debian.org` with SHA512. Ubuntu uses Canonical's
+versioned Noble or Resolute amd64 server `.img` from
 `cloud-images.ubuntu.com` with SHA256. The shared Proxmox script selects the
 declared checksum command from a fixed allowlist and verifies cached images too.
 
@@ -322,11 +328,12 @@ never created — first boot fails if it finds one.
 
 Docker packages come from the matching official repository. Debian uses
 `download.docker.com/linux/debian` with suite `trixie`; Ubuntu uses
-`download.docker.com/linux/ubuntu` with suite `noble`. Ubuntu installs and loads
-the packaged `/etc/apparmor.d/rootlesskit` AppArmor profile while leaving the system-wide
-unprivileged-user-namespace restriction enabled.
+`download.docker.com/linux/ubuntu` with the matching `noble` or `resolute`
+suite. Ubuntu installs and loads the packaged `/etc/apparmor.d/rootlesskit`
+AppArmor profile while leaving the system-wide unprivileged-user-namespace
+restriction enabled.
 
-Noble also runs rsyslog as the `syslog` account under AppArmor. Remote-logging
+Ubuntu also runs rsyslog as the `syslog` account under AppArmor. Remote-logging
 profiles grant that daemon only the journal-tree reads and volatile
 `/run/rsyslog` cursor access it needs. The exception is local to rsyslog's
 profile; AppArmor remains enforced.
@@ -387,8 +394,8 @@ otherwise run blind.
 
 ## LXC containers
 
-Debian 13 builds the same four profiles as Proxmox LXC containers. Ubuntu 24.04
-LXC is not included in this release. The Proxmox appliance exists, but its
+Debian 13 builds the same four profiles as Proxmox LXC containers. Ubuntu LXC
+is not included. Proxmox appliances exist, but their
 distro-specific bootstrap and runtime acceptance remain follow-up work. A container is not a
 small VM, so these are not the cloud-config translated into shell: the profile
 semantics are shared, and every mechanism that only makes sense for a VM is
