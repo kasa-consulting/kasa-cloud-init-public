@@ -264,6 +264,46 @@ apt-get update
 # a fix, and it is the order Docker's own install instructions use.
 apt-get install --yes --no-install-recommends ca-certificates
 
+#% if kasa_root_ca
+# The KASA internal root CA, so this container can validate certificates issued
+# by the internal PKI without per-service configuration. Public material: the
+# private half is generated inside OpenBao and never leaves it.
+#
+# The VM template gets this from cloud-init's ca_certs module, which runs in
+# cloud_init_modules well before packages and runcmd. A container has no
+# cloud-init, so the equivalent has to be explicit -- and it belongs here,
+# immediately after ca-certificates and before the dist-upgrade and any
+# third-party HTTPS repository, so everything later in this bootstrap already
+# sees the anchor.
+#
+# Debian's own bundle is left alone, deliberately. Dropping it is the container
+# equivalent of ca_certs.remove_defaults and would break apt over HTTPS and
+# every fetch in the rest of this run.
+#
+# The filename is ours rather than cloud-init's cloud-init-ca-cert-1.crt: no
+# cloud-init runs in this container, and a file named as if it did would send
+# the next person looking for a cloud-init log that does not exist.
+install_file /usr/local/share/ca-certificates/kasa-internal-root.crt 0644 <<'EOF'
+@@KASA_ROOT_CA_PEM@@
+EOF
+
+update-ca-certificates
+
+# Not decoration: update-ca-certificates exits 0 when it skips a certificate it
+# cannot parse, so "the file is on disk" is not the same claim as "the system
+# trusts it". Verifying the self-signed root against the store it was just added
+# to is the only check that distinguishes them -- once through the bundle that
+# curl, apt and Python read, and once through the hash directory that OpenSSL
+# itself walks, because a certificate can reach one and not the other.
+openssl verify -CAfile /etc/ssl/certs/ca-certificates.crt \
+  /usr/local/share/ca-certificates/kasa-internal-root.crt >/dev/null \
+  || fail "the KASA root CA is not in the system CA bundle"
+openssl verify -CApath /etc/ssl/certs \
+  /usr/local/share/ca-certificates/kasa-internal-root.crt >/dev/null \
+  || fail "the KASA root CA is not in the OpenSSL hash directory"
+log "KASA internal root CA installed and trusted"
+#% endif
+
 #% if docker
 # Down before any package operation, not just before the Docker install. On a
 # re-run Docker's repository is already on disk from the previous run, so the

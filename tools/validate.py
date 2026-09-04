@@ -73,6 +73,12 @@ HARDENING_SSHD_PATH = "/etc/ssh/sshd_config.d/99-harden.conf"
 SSH_USER_CA_KEY_PATH = "/etc/ssh/kasa_user_ca.pub"
 SSH_USER_CA_DROPIN_PATH = "/etc/ssh/sshd_config.d/60-kasa-user-ca.conf"
 
+# Where the LXC bootstrap installs the KASA internal root CA. The VM gets the same anchor
+# from cloud-init's ca_certs module, which names its own file; a container runs no
+# cloud-init, so it uses a KASA-owned name under the same operator-local directory.
+LXC_CA_ANCHOR_DIR = "/usr/local/share/ca-certificates"
+LXC_ROOT_CA_PATH = f"{LXC_CA_ANCHOR_DIR}/kasa-internal-root.crt"
+
 # Same shape kasa-ansible/roles/kasa_ssh_ca asserts, so a key one accepts and the other
 # rejects cannot exist.
 OPENSSH_PUBLIC_KEY = r"(ssh-ed25519|ssh-rsa|ecdsa-sha2-[a-z0-9-]+) [A-Za-z0-9+/]+=*( .*)?"
@@ -1446,6 +1452,111 @@ def validate_lxc_packages(profile: Profile, bootstrap: str) -> None:
         )
 
 
+def validate_lxc_ca_certs(profile: Profile, bootstrap: str) -> None:
+    """Give the container the VM's CA trust, and prove the anchor is live.
+
+    The VM's parity check is validate_ca_certs over the cloud-config's ca_certs block.
+    A container has no cloud-init, so the same trust has to be installed by hand -- and
+    the failure that motivates this check is silent: a guest with no anchor does not fail
+    to boot, it just cannot validate anything the internal PKI issued, and only the first
+    service to speak TLS finds out.
+    """
+    name = profile.name
+    configured = bool(CONFIG["KASA_ROOT_CA_FILE"])
+    body = strip_comments(bootstrap)
+
+    # Every file the bootstrap writes into the anchor directory, not only the one at
+    # LXC_ROOT_CA_PATH. Reading just the expected path collapses two different failures
+    # into one report: an anchor that was renamed, or given another extension, has to be
+    # reportable as a *wrong* anchor rather than as no anchor at all -- and the wrong
+    # extension is the case that fails silently on the guest, because
+    # update-ca-certificates reads only *.crt and exits 0 having read nothing.
+    written = re.findall(
+        rf"^install_file ({re.escape(LXC_CA_ANCHOR_DIR)}/\S+)", body, re.MULTILINE
+    )
+
+    if not written:
+        if configured:
+            report(
+                name,
+                "KASA_ROOT_CA_FILE is set but the LXC bootstrap installs no root CA; "
+                "the container would have none of the VM's PKI trust",
+            )
+        return
+    if not configured:
+        report(name, "the LXC bootstrap installs a root CA that configuration did not ask for")
+
+    for path in written:
+        if not path.endswith(".crt"):
+            report(
+                name,
+                f"the LXC CA anchor {path} is not a .crt file; "
+                "update-ca-certificates will not read it",
+            )
+
+    anchor = lxc_written_file(bootstrap, LXC_ROOT_CA_PATH)
+    if not anchor:
+        report(name, f"the LXC root CA must be installed at {LXC_ROOT_CA_PATH}")
+        # Keep every content rule below live against whatever was written instead, so a
+        # misnamed anchor is not also an unchecked one.
+        anchor = lxc_written_file(bootstrap, written[0])
+
+    # Same structural rules as the VM's ca_certs block, so an anchor one artifact
+    # family accepts and the other rejects cannot exist.
+    if "PRIVATE KEY" in anchor:
+        report(name, "the LXC root CA anchor contains a private key")
+    count = anchor.count("-----BEGIN CERTIFICATE-----")
+    if count != 1:
+        report(
+            name,
+            f"the LXC root CA anchor must hold exactly one PEM certificate, found {count}",
+        )
+
+    if "update-ca-certificates" not in body:
+        report(name, "the LXC bootstrap must run update-ca-certificates after writing the anchor")
+
+    # update-ca-certificates exits 0 when it skips a certificate it cannot parse, so
+    # writing the file and running the tool proves nothing on its own.
+    if "openssl verify -CAfile /etc/ssl/certs/ca-certificates.crt" not in body:
+        report(
+            name,
+            "the LXC bootstrap must verify the root CA against the system bundle; "
+            "update-ca-certificates exits 0 on a certificate it skipped",
+        )
+    if "openssl verify -CApath /etc/ssl/certs" not in body:
+        report(
+            name,
+            "the LXC bootstrap must verify the root CA against the OpenSSL hash "
+            "directory as well as the bundle",
+        )
+
+    # The container equivalent of ca_certs.remove_defaults. Dropping Debian's bundle
+    # breaks apt over HTTPS and every fetch in the rest of the bootstrap.
+    #
+    # The guard is that the bootstrap names neither path at all, rather than a list of
+    # spellings for removing them: a correct bootstrap has no reason to reference either,
+    # so any rm, sed, truncation or install_file that reaches them fails this -- including
+    # the ones nobody thought to enumerate.
+    for path in ("/usr/share/ca-certificates", "/etc/ca-certificates.conf"):
+        if path in body:
+            report(
+                name,
+                "the LXC bootstrap must not touch Debian's default CA trust: "
+                f"it names {path}",
+            )
+
+    # Ordering, for the same reason the VM uses cloud-init's module rather than a
+    # runcmd: everything later in the bootstrap must already see the anchor.
+    install = body.find(f"install_file {LXC_ROOT_CA_PATH}")
+    for later, message in (
+        ("apt-get dist-upgrade", "the base-system upgrade"),
+        ("install_file /etc/apt/sources.list.d/docker.sources", "Docker's HTTPS repository"),
+    ):
+        position = body.find(later)
+        if position != -1 and install > position:
+            report(name, f"the root CA must be trusted before {message}")
+
+
 def validate_lxc_logging(profile: Profile, bootstrap: str) -> None:
     """Port the VM's logging policy, including what the local profiles omit."""
     name = profile.name
@@ -2149,6 +2260,7 @@ def main() -> int:
             validate_lxc_ssh(profile, bootstrap)
             validate_lxc_sysctl(profile, bootstrap)
             validate_lxc_packages(profile, bootstrap)
+            validate_lxc_ca_certs(profile, bootstrap)
             validate_lxc_logging(profile, bootstrap)
             validate_lxc_var_log(profile, bootstrap)
             validate_lxc_appdata(profile, bootstrap)
