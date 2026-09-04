@@ -6,8 +6,8 @@
 os: debian
 version: "13"
 codename: trixie
-build: "20260722-2547"
-name: debian-13-genericcloud-amd64-20260722-2547.qcow2
-url: https://cloud.debian.org/images/cloud/trixie/20260722-2547/debian-13-genericcloud-amd64-20260722-2547.qcow2
+build: "20260831-2587"
+name: debian-13-genericcloud-amd64-20260831-2587.qcow2
+url: https://cloud.debian.org/images/cloud/trixie/20260831-2587/debian-13-genericcloud-amd64-20260831-2587.qcow2
 checksum_algorithm: sha512
-checksum: 735d1b2d0ef265a0c2323fdaa7d46e7bd7a1b984f73e8a785e638034bf07876e26374a9d809d713501270c071b3464d2ada0c5589f07742b95ed853cc6d48f45
+checksum: 8ea9faae810043a0b35b0149f05014f26705c2339ffb11ead308f33e844a87cc3ef46ec81d5262b38817b6a88af404874d48a5857ebe072ef6a31dfb6e371f50
