@@ -643,6 +643,11 @@ write_files:
         local failure_line="$2"
         trap - ERR
         rm -f "$success_marker"
+        # See the matching comment in cloud-init-finalize: a failed bootstrap is otherwise
+        # silent, and on a -syslog profile the journal does not survive a reboot.
+        logger -t kasa-bootstrap -p daemon.err \
+          "KASA bootstrap verification FAILED at line ${failure_line} (exit ${exit_code}); full log at /home/admin/logs/cloud-init-full.log" \
+          || true
         /usr/local/sbin/cloud-init-report failure "$exit_code" "$failure_line" || true
         exit "$exit_code"
       }
@@ -744,6 +749,15 @@ write_files:
         local failure_line="$2"
         trap - ERR
         rm -f "$precheck_marker"
+        # To the collector, not only to disk. A failed bootstrap is otherwise silent: a
+        # failing runcmd is recorded by cloud-init as a WARNING, the semaphore is written
+        # anyway, and `cloud-init status` goes on reporting `done` with `errors: []`. On a
+        # -syslog profile the journal is volatile, so the local copy does not survive a
+        # reboot either -- and the report below writes somewhere nobody looks until they
+        # already suspect something. This line is what makes the failure findable.
+        logger -t kasa-bootstrap -p daemon.err \
+          "KASA bootstrap FAILED at line ${failure_line} (exit ${exit_code}); full log at /home/admin/logs/cloud-init-full.log" \
+          || true
         /usr/local/sbin/cloud-init-report failure "$exit_code" "$failure_line" || true
         exit "$exit_code"
       }
@@ -848,7 +862,39 @@ write_files:
       # malformed CA key. sshd -T is then the only thing that proves the drop-in was
       # included rather than written and silently ignored.
       ssh-keygen -l -f /etc/ssh/kasa_user_ca.pub >/dev/null
-      sshd_effective="$(/usr/sbin/sshd -T 2>/dev/null)"
+
+      # sshd -T is retried, and its failure is reported as its own failure.
+      #
+      # It loads the entire effective configuration, host keys included, so on a first
+      # boot it can exit non-zero for reasons that have nothing to do with this drop-in --
+      # a host key cloud-init has not finished generating being the likely one. When it
+      # does, it writes nothing to stdout.
+      #
+      # The previous version discarded both the exit status and stderr, so any such
+      # failure reached the operator as "the SSH user CA was installed but sshd is not
+      # serving it": a different problem, with a different fix, and one that sends you
+      # looking at a drop-in that is perfectly correct. Measured on librechat (VM 211) on
+      # 2026-09-02, where this aborted the bootstrap 1.07 seconds in and left the guest
+      # without its rootless Docker setup -- and, because a failed runcmd does not stop
+      # cloud-init reporting `done`, looking healthy.
+      sshd_probe_error=/run/kasa-sshd-config-test.err
+      sshd_effective=""
+      sshd_ok=0
+      for _ in $(seq 1 30); do
+        if sshd_effective="$(/usr/sbin/sshd -T 2>"$sshd_probe_error")"; then
+          sshd_ok=1
+          break
+        fi
+        sleep 1
+      done
+      if [ "$sshd_ok" -ne 1 ]; then
+        echo "sshd -T did not succeed within 30s:" >&2
+        cat "$sshd_probe_error" >&2 || true
+        rm -f "$sshd_probe_error"
+        on_error 1 "$LINENO"
+      fi
+      rm -f "$sshd_probe_error"
+
       if grep -qi '^trustedusercakeys /etc/ssh/kasa_user_ca\.pub$' \
         <<<"$sshd_effective"; then
         ssh_anchor="${ssh_anchor:+$ssh_anchor and }SSH user CA"

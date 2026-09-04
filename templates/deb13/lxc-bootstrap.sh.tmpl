@@ -54,7 +54,14 @@ ADMIN_KEYS=/home/admin/.ssh/authorized_keys
 
 log()  { printf '[kasa] %s\n' "$*"; }
 warn() { printf '[kasa] WARNING: %s\n' "$*" >&2; }
-fail() { printf '[kasa] ERROR: %s\n' "$*" >&2; exit 1; }
+# logger as well as stderr: an LXC -syslog bootstrap that aborts leaves nothing behind
+# otherwise, because the journal is volatile and the container is usually destroyed and
+# recreated before anyone reads it. The collector is the durable copy.
+fail() {
+  printf '[kasa] ERROR: %s\n' "$*" >&2
+  logger -t kasa-bootstrap -p daemon.err "KASA LXC bootstrap FAILED: $*" || true
+  exit 1
+}
 
 on_error() {
   printf '[kasa] ERROR: bootstrap failed at line %s (exit %s)\n' "$2" "$1" >&2
@@ -899,8 +906,29 @@ fi
 #% if ssh_user_ca
 # sshd -T reads the effective configuration, so a drop-in that parsed but was ignored
 # still shows up here as absent.
-if /usr/sbin/sshd -T 2>/dev/null \
-    | grep -qi '^trustedusercakeys /etc/ssh/kasa_user_ca\.pub$'; then
+# sshd -T is retried, and its failure is reported as its own failure. It loads the whole
+# effective configuration, host keys included, so early in a bootstrap it can exit non-zero
+# for reasons unrelated to this drop-in -- and it writes nothing to stdout when it does.
+# Discarding the status turned any such failure into "the CA is not being served", which is
+# a different problem with a different fix. See the matching comment in cloud-config.yml.tmpl.
+sshd_probe_error=/run/kasa-sshd-config-test.err
+sshd_effective=""
+sshd_ok=0
+for _ in $(seq 1 30); do
+  if sshd_effective="$(/usr/sbin/sshd -T 2>"$sshd_probe_error")"; then
+    sshd_ok=1
+    break
+  fi
+  sleep 1
+done
+if [ "$sshd_ok" -ne 1 ]; then
+  log "sshd -T did not succeed within 30s: $(cat "$sshd_probe_error" 2>/dev/null)"
+  rm -f "$sshd_probe_error"
+  fail "sshd -T did not succeed; the SSH configuration could not be read"
+fi
+rm -f "$sshd_probe_error"
+
+if grep -qi '^trustedusercakeys /etc/ssh/kasa_user_ca\.pub$' <<<"$sshd_effective"; then
   ssh_anchor="${ssh_anchor:+$ssh_anchor and }SSH user CA"
 else
   fail "the SSH user CA was installed but sshd is not serving it"
