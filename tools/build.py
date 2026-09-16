@@ -152,6 +152,7 @@ def render_command(
         "@@VMID@@": str(vendor.vmid),
         "@@NAME@@": vendor.template_name,
         "@@CPU@@": CONFIG["CPU"],
+        "@@CPU_TYPE@@": CONFIG["CPU_TYPE"],
         "@@MEM_MIN@@": CONFIG["MEM_MIN"],
         "@@MEM_MAX@@": CONFIG["MEM_MAX"],
         "@@BRIDGE@@": CONFIG["BRIDGE"],
@@ -172,7 +173,7 @@ def render_command(
         "@@IMAGE_URL@@": image.url,
     }
     quoted = {marker: shlex.quote(value) for marker, value in replacements.items()}
-    flags = {**profile_flags(profile), "uefi": load_release(release).uefi}
+    flags = profile_flags(profile)
     try:
         return expand_template(COMMAND_TEMPLATE, flags, quoted)
     except ValueError as error:
@@ -356,6 +357,20 @@ def validate_generated_command(
     ):
         if fragment not in command:
             fail(f"generated Proxmox command is missing image verification: {fragment}")
+
+    # A cached image must be checked against the pin and replaced when it fails,
+    # not trusted by filename. Ubuntu's image name carries no build, so the same
+    # path holds a different image after every re-pin.
+    if "image_needs_download" not in command:
+        fail(
+            "generated Proxmox command must verify a cached image against the pin "
+            "rather than trusting its filename"
+        )
+    if "mv --no-clobber" in command:
+        fail(
+            "generated Proxmox command must replace an image that failed the pin; "
+            "--no-clobber would keep the stale build"
+        )
     if re.search(r"^\s*eval\b", command, re.MULTILINE):
         fail("generated Proxmox command must not eval a checksum command")
 
@@ -369,39 +384,71 @@ def validate_generated_command(
     if "tag=${VLAN_TAG}" not in command:
         fail("generated Proxmox command must tag the NIC when a VLAN is configured")
 
-    # q35 either way. It is the PCIe machine type, which the firmware choice does
-    # not change, and dropping to i440fx would silently remove PCIe from every
-    # guest that later needs a passed-through device.
-    if "--machine q35" not in command:
-        fail("generated Proxmox command must use the q35 machine type")
+    # One hardware profile for every release, by operator decision on 2026-09-15;
+    # AGENTS.md records it and what each part costs. Asserted here rather than in
+    # the template alone, because the template is the thing that could change.
+    if f"CPU_TYPE={shlex.quote(CONFIG['CPU_TYPE'])}" not in command:
+        fail("generated Proxmox command must carry the configured CPU_TYPE")
+    if '--cpu "$CPU_TYPE"' not in command:
+        fail("generated Proxmox command must set the CPU model from CPU_TYPE")
+    if "--cpu host" in command:
+        fail(
+            "generated Proxmox command must not pin the CPU to the building node's "
+            "model; a host-model template will not migrate"
+        )
 
-    if load_release(release).uefi:
-        # UEFI, and the EFI variable store it needs. A template booted through OVMF
-        # without an efidisk0 keeps its boot entries nowhere, so it survives the build
-        # and fails on the first clone that reboots.
-        if "--bios ovmf" not in command:
-            fail("generated Proxmox command must boot the template through OVMF")
-        if "seabios" in command:
-            fail("generated Proxmox command must not select the legacy BIOS")
-        if command.count("--efidisk0") != 1:
-            fail("generated Proxmox command must attach exactly one EFI disk")
-        if "efitype=4m" not in command:
-            fail("generated Proxmox command must use the 4m EFI variable store")
-        if "pre-enrolled-keys=1" not in command:
-            fail("generated Proxmox command must enrol the Secure Boot keys")
-    else:
-        # A legacy-BIOS release must carry no EFI remnant. An efidisk0 alongside
-        # --bios seabios is dead storage the guest never reads, and a stray
-        # pre-enrolled-keys would read as Secure Boot to anyone auditing the script.
-        if "--bios seabios" not in command:
-            fail("generated Proxmox command must boot the template through SeaBIOS")
-        if "ovmf" in command:
-            fail("generated Proxmox command must not select OVMF")
-        if "--efidisk0" in command:
-            fail("a legacy-BIOS template must not attach an EFI variable store")
-        for remnant in ("efitype=", "pre-enrolled-keys="):
-            if remnant in command:
-                fail(f"legacy-BIOS template carries an EFI remnant: {remnant}")
+    # i440fx on every release. Chosen for the widest guest compatibility, and it
+    # is the part of this profile with a real cost: i440fx exposes no PCIe root,
+    # so a guest that later needs a passed-through device wants q35 instead.
+    #
+    # The literal is "pc", which is Proxmox's name for the i440fx machine and the
+    # only spelling of it the API accepts -- `--machine i440fx` is rejected at
+    # create time with "machine.type: value does not match the regex pattern",
+    # which is a failure the build must catch rather than the node.
+    if "--machine pc" not in command:
+        fail(
+            "generated Proxmox command must use the i440fx machine type, spelled "
+            "as Proxmox spells it: --machine pc"
+        )
+    # Only the flag, not the word: the script explains in prose why i440fx puts
+    # the cloud-init seed on a bus the guest cannot read, and that comment is
+    # worth keeping.
+    if "--machine i440fx" in command:
+        fail("Proxmox does not accept i440fx as a machine type; use pc")
+    if "q35" in command:
+        fail("generated Proxmox command must not use the q35 machine type")
+
+    # UEFI, and the EFI variable store it needs. A template booted through OVMF
+    # without an efidisk0 keeps its boot entries nowhere, so it survives the build
+    # and fails on the first clone that reboots.
+    if "--bios ovmf" not in command:
+        fail("generated Proxmox command must boot the template through OVMF")
+    if "seabios" in command:
+        fail("generated Proxmox command must not select the legacy BIOS")
+    if command.count("--efidisk0") != 1:
+        fail("generated Proxmox command must attach exactly one EFI disk")
+    if "efitype=4m" not in command:
+        fail("generated Proxmox command must use the 4m EFI variable store")
+
+    # Keys not enrolled: an empty variable store, so Secure Boot is off and the
+    # kernel stays out of lockdown. Deliberate -- it is what lets a clone load an
+    # unsigned out-of-tree module without per-clone efidisk0 surgery -- so the
+    # build asserts the empty store rather than merely tolerating it.
+    if "pre-enrolled-keys=0" not in command:
+        fail("generated Proxmox command must leave the Secure Boot keys unenrolled")
+    if "pre-enrolled-keys=1" in command:
+        fail("generated Proxmox command must not enrol the Secure Boot keys")
+
+    # The cloud-init seed must not ride the IDE bus. i440fx puts ide2 on the PIIX
+    # controller, where the Debian cloud kernel never enumerates the ATAPI CD, so
+    # the guest gets no datasource and cloud-init silently does not run.
+    if "--scsi2 \"${VM_STORAGE_NAME}:cloudinit\"" not in command:
+        fail("generated Proxmox command must attach the cloud-init drive to scsi2")
+    if "--ide2" in command:
+        fail(
+            "generated Proxmox command must not put the cloud-init drive on ide2; "
+            "on i440fx the guest never enumerates it and cloud-init does not run"
+        )
 
     validate_injected_keys(f"{vendor.template_name} create script", command)
 

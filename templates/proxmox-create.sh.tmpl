@@ -5,6 +5,7 @@ set -Eeuo pipefail
 VMID=@@VMID@@
 NAME=@@NAME@@
 CPU=@@CPU@@
+CPU_TYPE=@@CPU_TYPE@@
 MEM_MIN=@@MEM_MIN@@
 MEM_MAX=@@MEM_MAX@@
 BRIDGE=@@BRIDGE@@
@@ -150,14 +151,35 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-if [ ! -e "$image_path" ]; then
+# A cached image is only usable if it is the pinned one. Debian's filename
+# carries its build, so a re-pin changes the path and the old file is simply
+# never asked for again. Canonical's does not -- ubuntu-24.04-server-cloudimg-
+# amd64.img is the same name for every build -- so a re-pin leaves the previous
+# build sitting at exactly the path this script wants. Trusting the name would
+# build a template from an unpinned image; verifying and then stopping would
+# block every future build on a stale file nobody thinks to delete. The pin is
+# the authority, so a mismatch is re-downloaded over.
+image_needs_download=1
+if [ -e "$image_path" ]; then
+  if printf '%s  %s\n' "$IMAGE_CHECKSUM" "$image_path" |
+    "$image_checksum_command" --status --check -; then
+    image_needs_download=0
+  else
+    echo "Cached image is not the pinned build; re-downloading: $image_path" >&2
+  fi
+fi
+
+if [ "$image_needs_download" -eq 1 ]; then
   image_temp="$(mktemp --tmpdir="$ISO_STORAGE_PATH" ".${IMAGE_NAME}.XXXXXX")"
   curl --fail --location --proto '=https' --tlsv1.2 --retry 5 \
     --output "$image_temp" "$IMAGE_URL"
   printf '%s  %s\n' "$IMAGE_CHECKSUM" "$image_temp" | "$image_checksum_command" --check -
   chmod 0644 "$image_temp"
-  mv --no-clobber -- "$image_temp" "$image_path"
-  [ -e "$image_temp" ] || image_temp=""
+  # Overwrites on purpose: the destination is either absent or a build that
+  # failed the pin. A concurrent build racing this one wrote the same verified
+  # bytes, so whichever lands last is still the pinned image.
+  mv --force -- "$image_temp" "$image_path"
+  image_temp=""
 fi
 printf '%s  %s\n' "$IMAGE_CHECKSUM" "$image_path" | "$image_checksum_command" --check -
 
@@ -186,20 +208,14 @@ create_template() {
   qm create "$vmid" \
     --name "$name" \
     --cores "$CPU" \
-    --cpu host \
+    --cpu "$CPU_TYPE" \
     --memory "$MEM_MAX" \
     --balloon "$MEM_MIN" \
     --net0 "$net0" \
     --scsihw virtio-scsi-single \
-#% if uefi
-    --machine q35 \
+    --machine pc \
     --bios ovmf \
-    --efidisk0 "${VM_STORAGE_NAME}:1,efitype=4m,pre-enrolled-keys=1" \
-#% endif
-#% if not uefi
-    --machine q35 \
-    --bios seabios \
-#% endif
+    --efidisk0 "${VM_STORAGE_NAME}:1,efitype=4m,pre-enrolled-keys=0" \
     --serial0 socket \
     --vga serial0 \
     --cicustom "vendor=${vendor_volume}" \
@@ -230,8 +246,17 @@ create_template() {
   qm set "$vmid" \
     --scsi1 "${VM_STORAGE_NAME}:${APPDATA_DISK_SIZE},ssd=1,discard=on,iothread=1,backup=1,serial=${APPDATA_SERIAL},wwn=${APPDATA_WWN}"
 
+  # The cloud-init drive goes on the SCSI bus, not ide2. On i440fx Proxmox wires
+  # ide2 to the PIIX IDE controller, and the Debian cloud kernel never enumerates
+  # the ATAPI CD there: ata_piix binds both channels and reports no device, so
+  # there is no /dev/sr0, NoCloud finds no seed, and cloud-init does not run at
+  # all. That failure is silent in the worst way -- the template builds, and the
+  # clone boots to a login prompt with no hostname, no injected keys and no
+  # hardening. Measured on Debian 13 clone 9653 on 2026-09-15: ide2 on i440fx
+  # gave no sr0; the same drive on the virtio-scsi bus gave
+  # `DataSourceNoCloud [seed=/dev/sr0]` and `cloud-init status: done`.
   qm set "$vmid" \
-    --ide2 "${VM_STORAGE_NAME}:cloudinit" \
+    --scsi2 "${VM_STORAGE_NAME}:cloudinit" \
     --boot order=scsi0
 
   # The cloud-init drive exists now, so confirm Proxmox really generated the

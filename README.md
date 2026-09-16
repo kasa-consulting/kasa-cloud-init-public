@@ -127,33 +127,46 @@ Ubuntu uses the same names with `ubuntu24` or `ubuntu26` in place of `deb13`.
 Debian occupies `VMID_START +0..3`, Ubuntu 24.04 occupies `+4..7`, and Ubuntu
 26.04 occupies `+8..11`. The build fails if the ranges ever overlap.
 
-Firmware differs by release, and both run on a `q35` machine.
+Every release builds the same virtual hardware.
 
-**Debian 13 boots through UEFI with Secure Boot enforced.** The script sets
-`bios: ovmf` and attaches a 4 MB EFI variable store as `efidisk0` with
-Microsoft's keys enrolled. The pinned image ships a signed shim, grub, and
-kernel. Enforcing Secure Boot also puts the kernel in lockdown `integrity`,
-which blocks unsigned module loading, `/dev/mem` and kexec.
+**UEFI, with Secure Boot keys not enrolled.** The script sets `bios: ovmf` and
+attaches a 4 MB EFI variable store as `efidisk0` at `pre-enrolled-keys=0`. The
+store is not optional: OVMF keeps its boot entries there, so a template built
+without one survives its own build and then fails on the first clone that
+reboots.
 
-Two limits worth stating plainly. The template does not use a signed unified
-kernel image, so this is not a complete boot-integrity story. A guest-root attacker can still
-persist through `/boot/initrd.img`. And no vTPM is attached, so nothing consumes
-the boot measurements. Treat it as hardening, not attestation.
+An empty store means Secure Boot is off. **Do not describe these templates as
+Secure Boot hardened.** That is the deliberate part: the kernel is not in
+lockdown, so a guest that needs an unsigned out-of-tree module loads it with no
+MOK enrollment and no per-clone `efidisk0` surgery. An NVIDIA driver for a
+passed-through GPU is the usual case.
 
-**Ubuntu boots legacy BIOS.** `bios: seabios`, no EFI variable store, no
-Secure Boot. Do not describe these templates as Secure Boot hardened. The
-deliberate consequence is that the kernel is not in lockdown, so a guest that
-needs an unsigned out-of-tree module loads it without MOK enrollment. An NVIDIA
-driver for a passed-through GPU is the usual case. The pinned Canonical
-image is hybrid-bootable and carries the bios_grub partition this needs.
-
-On Debian, a guest that needs an out-of-tree kernel module will fail to load it.
-Give that one clone its own unenforced variable store rather than weakening the
-template. Ubuntu guests need no such workaround:
+To enforce Secure Boot on one clone instead, give that clone its own enrolled
+store rather than changing the template:
 
 ```bash
-qm set VMID --efidisk0 STORAGE:1,efitype=4m,pre-enrolled-keys=0
+qm set VMID --efidisk0 STORAGE:1,efitype=4m,pre-enrolled-keys=1
 ```
+
+**The cloud-init drive is on `scsi2`, not `ide2`.** On an i440fx machine the
+guest never enumerates an ATAPI CD on the PIIX IDE controller, so a seed on
+`ide2` is invisible and cloud-init does not run -- while the clone still boots to
+a login prompt, unconfigured. Keep it on the SCSI bus.
+
+**`machine: pc`.** That is Proxmox's name for the i440fx machine -- the
+widest-compatibility machine type, and the one part of this profile with a real
+cost: i440fx exposes no PCIe root complex. A guest that needs a passed-through
+device wants `q35`, so set that on the clone.
+
+**`cpu: x86-64-v3`.** The AVX2-era baseline: AVX/AVX2, BMI1/BMI2, FMA and MOVBE
+over v2, and QEMU builds it on the v2-AES feature set, so AES-NI is included and
+disk and TLS work stays in hardware. `CPU_TYPE` in `tools/.env` changes it.
+
+It is a baseline, not a free upgrade: every node a clone may land on has to
+present these features, which rules out pre-Haswell Intel and pre-Excavator AMD.
+Drop to `x86-64-v2-AES` on a cluster with an older node. `host` is deliberately
+not the default either -- a template is cloned onto whichever node has room, and
+a host-model guest can only run on a node like the one that built it.
 
 Each script downloads and verifies its pinned OS image, checks the VM ID is free,
 and creates the template. Boot it once: a successful first boot leaves the VM

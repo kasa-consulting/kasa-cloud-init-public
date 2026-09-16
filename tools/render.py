@@ -105,7 +105,18 @@ NETWORK_KEY_DEFAULTS = {
 }
 NETWORK_KEYS = frozenset(NETWORK_KEY_DEFAULTS)
 
-CONFIG_KEYS = SITE_KEYS | BUILD_KEYS | LXC_KEYS | TRUST_KEYS | NETWORK_KEYS
+# CPU_TYPE is optional for the same reason as the keys above: an existing
+# tools/.env predates it. The default is a named baseline rather than a copy of
+# whichever node happened to build the template -- AGENTS.md records what v3
+# requires of a node and why it is still not `host`.
+HARDWARE_KEY_DEFAULTS = {
+    "CPU_TYPE": "x86-64-v3",
+}
+HARDWARE_KEYS = frozenset(HARDWARE_KEY_DEFAULTS)
+
+CONFIG_KEYS = (
+    SITE_KEYS | BUILD_KEYS | LXC_KEYS | TRUST_KEYS | NETWORK_KEYS | HARDWARE_KEYS
+)
 
 # An empty value means "not configured" rather than a malformed line.
 #
@@ -158,11 +169,11 @@ class Image:
 class Release:
     """One OS release's identity and the artifact families it ships.
 
-    `uefi` carries the firmware decision with the release rather than the
-    profile, because it is a property of the pinned image and the operator's
-    intent for the whole release, not of the logging or Docker matrix. Both
-    pinned images are hybrid-bootable, so either firmware works; AGENTS.md
-    records why each release is set the way it is.
+    Firmware is deliberately not a field here. It was one while Debian booted
+    UEFI and Ubuntu booted legacy BIOS; on 2026-09-15 the operator set one
+    hardware profile for every release, so the choice has exactly one value and
+    belongs in the create template rather than in a per-release flag that can
+    only ever read the same. AGENTS.md records the decision.
     """
 
     name: str
@@ -171,13 +182,12 @@ class Release:
     codename: str
     vmid_offset: int
     lxc: bool
-    uefi: bool
 
 
 RELEASES = {
-    "deb13": Release("deb13", "debian", "13", "trixie", 0, True, True),
-    "ubuntu24": Release("ubuntu24", "ubuntu", "24.04", "noble", 4, False, False),
-    "ubuntu26": Release("ubuntu26", "ubuntu", "26.04", "resolute", 8, False, False),
+    "deb13": Release("deb13", "debian", "13", "trixie", 0, True),
+    "ubuntu24": Release("ubuntu24", "ubuntu", "24.04", "noble", 4, False),
+    "ubuntu26": Release("ubuntu26", "ubuntu", "26.04", "resolute", 8, False),
 }
 
 
@@ -413,10 +423,22 @@ def load_config(profiles: tuple[Profile, ...]) -> dict[str, str]:
             raw_value, line_number, allow_empty=key in OPTIONAL_EMPTY_KEYS
         )
 
-    missing = sorted(CONFIG_KEYS - LXC_KEYS - TRUST_KEYS - NETWORK_KEYS - values.keys())
+    missing = sorted(
+        CONFIG_KEYS
+        - LXC_KEYS
+        - TRUST_KEYS
+        - NETWORK_KEYS
+        - HARDWARE_KEYS
+        - values.keys()
+    )
     if missing:
         raise ValueError(f"{CONFIG_FILE}: missing required keys: {missing}")
-    for defaults in (LXC_KEY_DEFAULTS, TRUST_KEY_DEFAULTS, NETWORK_KEY_DEFAULTS):
+    for defaults in (
+        LXC_KEY_DEFAULTS,
+        TRUST_KEY_DEFAULTS,
+        NETWORK_KEY_DEFAULTS,
+        HARDWARE_KEY_DEFAULTS,
+    ):
         for key, default in defaults.items():
             values.setdefault(key, default)
 
@@ -535,6 +557,12 @@ def load_config(profiles: tuple[Profile, ...]) -> dict[str, str]:
             raise ValueError(f"{CONFIG_FILE}: {key} contains unsupported characters")
     if not Path(values["ISO_STORAGE_PATH"]).expanduser().is_absolute():
         raise ValueError(f"{CONFIG_FILE}: ISO_STORAGE_PATH must be an absolute path")
+
+    # Proxmox CPU model names are alphanumerics, hyphens, underscores and dots
+    # (x86-64-v3, Broadwell-noTSX, EPYC-Rome). Anything else would reach
+    # `qm create --cpu` as a value it cannot parse, or as a second argument.
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", values["CPU_TYPE"]):
+        raise ValueError(f"{CONFIG_FILE}: CPU_TYPE contains unsupported characters")
 
     for key in (
         "VMID_START",
