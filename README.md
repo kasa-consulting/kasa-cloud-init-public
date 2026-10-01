@@ -153,10 +153,8 @@ guest never enumerates an ATAPI CD on the PIIX IDE controller, so a seed on
 `ide2` is invisible and cloud-init does not run -- while the clone still boots to
 a login prompt, unconfigured. Keep it on the SCSI bus.
 
-**`machine: pc`.** That is Proxmox's name for the i440fx machine -- the
-widest-compatibility machine type, and the one part of this profile with a real
-cost: i440fx exposes no PCIe root complex. A guest that needs a passed-through
-device wants `q35`, so set that on the clone.
+**`machine: q35`.** Every template provides a PCIe root complex, so clones
+can support PCIe passthrough without changing their machine type.
 
 **`cpu: x86-64-v3`.** The AVX2-era baseline: AVX/AVX2, BMI1/BMI2, FMA and MOVBE
 over v2, and QEMU builds it on the v2-AES feature set, so AES-NI is included and
@@ -640,6 +638,26 @@ container, checks the resulting `pct config`, starts it, verifies the bootstrap'
 checksum, uploads it, and prints the one command that completes the container:
 
 ```bash
+pct exec 9101 -- /root/kasa-deb13-lxc-docker-syslog-bootstrap.sh
+```
+
+`--hwaddr MAC` gives `net0` a fixed MAC instead of a random one. The script
+upper-cases it, refuses a malformed, multicast or all-zero address, and reads
+`pct config` back to confirm `net0` carries it.
+
+`--no-start` creates the container and runs every post-create check, then stops
+before the first boot: it does not start the container or upload the bootstrap
+(`pct push` needs a running container). It prints the remaining commands, in
+order, so the guest firewall can be written in between. The container is created
+with `onboot 0` and the script reads that back, so a node reboot cannot start it
+before its guest firewall exists either; set `onboot 1` only once the firewall is
+written and the container runs:
+
+```bash
+pct start 9101
+until [ "$(pct status 9101)" = "status: running" ]; do sleep 1; done
+pct set 9101 --onboot 1   # only once its guest firewall exists
+pct push 9101 /root/kasa-deb13-lxc-docker-syslog-bootstrap.sh /root/kasa-deb13-lxc-docker-syslog-bootstrap.sh --perms 0755
 pct exec 9101 -- /root/kasa-deb13-lxc-docker-syslog-bootstrap.sh
 ```
 

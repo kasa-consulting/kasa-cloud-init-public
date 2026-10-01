@@ -626,6 +626,343 @@ write_files:
       chown -R admin:admin "$log_dir"
       find "$log_dir" -maxdepth 1 -type f -exec chmod 0600 {} +
 
+  # cloud-init deletes status.json at the start of every boot, so `cloud-init status`
+  # describes only the boot it runs on. A first boot that was interrupted, or that
+  # failed and was then rebooted, leaves nothing behind that says so, and the next boot
+  # reports `done`. This keeps each earlier boot's final status so the verifier can
+  # judge the whole bootstrap rather than whichever boot it happens to run on.
+  - path: /usr/local/sbin/cloud-init-bootstrap-history
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/usr/bin/python3
+      """What cloud-init recorded about every boot of this instance.
+
+        archive               keep the previous boot's status, before init-local deletes it
+        verify                every earlier boot is clean, or superseded by a rerun
+        eligible              the failure is one cloud-init-rerun-bootstrap can repair;
+                              prints this boot's number
+        approved-deprecation  print the one recoverable error the verifier accepts
+      """
+
+      import json
+      import os
+      import sys
+      from pathlib import Path
+
+      INSTANCE = Path("/var/lib/cloud/instance")
+      STATUS = Path("/var/lib/cloud/data/status.json")
+      ARCHIVE = INSTANCE / "kasa-boot-status"
+      RERUN_RECORD = INSTANCE / "kasa-bootstrap-rerun"
+      SUCCESS_MARKER = INSTANCE / "boot-success"
+      # Written by cloud-init's final_message at the very end of every boot's final
+      # stage, and deleted by the next boot's init-local. Still present when archive
+      # runs means the boot got that far.
+      BOOT_FINISHED = INSTANCE / "boot-finished"
+      STAGES = ("init-local", "init", "modules-config", "modules-final")
+      # cloud-init-rerun-bootstrap re-executes this stage and no other, so a failure in
+      # any earlier stage is not something a rerun repairs.
+      RERUN_STAGE = "modules-final"
+      APPROVED_DEPRECATION = (
+          "'user' of type string is deprecated in 22.2 and scheduled to be removed "
+          "in 27.2. Use 'users' list instead."
+      )
+
+
+      def load(path):
+          try:
+              return json.loads(path.read_text(encoding="utf-8"))
+          except (OSError, ValueError):
+              return None
+
+
+      def recoverable_approved(recoverable):
+          if not recoverable:
+              return True
+          if not isinstance(recoverable, dict) or set(recoverable) != {"DEPRECATED"}:
+              return False
+          messages = recoverable["DEPRECATED"]
+          return isinstance(messages, list) and all(
+              message == APPROVED_DEPRECATION for message in messages
+          )
+
+
+      def stage_problems(status, reached_the_end=True):
+          """Map every stage that did not finish cleanly to the reason."""
+          v1 = status.get("v1") if isinstance(status, dict) else None
+          if not isinstance(v1, dict):
+              return {stage: "status is unreadable" for stage in STAGES}
+          problems = {}
+          for stage in STAGES:
+              entry = v1.get(stage)
+              if not isinstance(entry, dict) or not entry.get("start"):
+                  problems[stage] = "never started"
+              elif not entry.get("finished"):
+                  problems[stage] = "started and never finished"
+              elif entry.get("errors"):
+                  problems[stage] = "; ".join(str(error) for error in entry["errors"])
+              elif not recoverable_approved(entry.get("recoverable_errors")):
+                  problems[stage] = "recoverable errors besides the approved deprecation"
+          # A clean shutdown's SIGTERM is not always an error in status.json: cloud-init
+          # 26.1 (Ubuntu 24.04) exits 0 on it, so the interrupted stage reads as finished
+          # with no errors. The stages after it never start, which is caught above, so a
+          # boot that never reached final_message with nothing else wrong was cut off
+          # inside modules-final.
+          if not reached_the_end and not problems:
+              problems[RERUN_STAGE] = "cut off before cloud-init finished the boot"
+          return problems
+
+
+      def describe(number, problems):
+          reasons = "; ".join(f"{stage} {reason}" for stage, reason in problems.items())
+          return f"boot {number}: {reasons}"
+
+
+      def archived_boots():
+          """Earlier boots of this instance as (number, problems), oldest first."""
+          if not ARCHIVE.is_dir():
+              return []
+          boots = [
+              (
+                  int(path.stem),
+                  stage_problems(
+                      load(path),
+                      not (ARCHIVE / f"{path.stem}.unfinished").exists(),
+                  ),
+              )
+              for path in ARCHIVE.glob("*.json")
+              if path.stem.isdigit()
+          ]
+          return sorted(boots, key=lambda boot: boot[0])
+
+
+      def superseded_through():
+          try:
+              lines = RERUN_RECORD.read_text(encoding="utf-8").splitlines()
+          except OSError:
+              return 0
+          for line in lines:
+              key, _, value = line.partition("=")
+              if key == "superseded_through" and value.isdigit():
+                  return int(value)
+          return 0
+
+
+      def archive():
+          # The bytes, not a parse: a truncated status stays truncated here and is
+          # judged unreadable by verify, rather than dropped.
+          if SUCCESS_MARKER.exists() or not STATUS.is_file() or not INSTANCE.is_dir():
+              return 0
+          ARCHIVE.mkdir(mode=0o700, exist_ok=True)
+          boots = archived_boots()
+          number = boots[-1][0] + 1 if boots else 1
+          # The marker first, so a record can never exist without it.
+          if not BOOT_FINISHED.exists():
+              (ARCHIVE / f"{number}.unfinished").touch()
+          partial = ARCHIVE / f".{number}.json.partial"
+          partial.write_bytes(STATUS.read_bytes())
+          os.replace(partial, ARCHIVE / f"{number}.json")
+          return 0
+
+
+      def verify():
+          floor = superseded_through()
+          rerunnable, unrecoverable = [], []
+          for number, problems in archived_boots():
+              if not problems:
+                  continue
+              if set(problems) == {RERUN_STAGE}:
+                  if number > floor:
+                      rerunnable.append(describe(number, problems))
+              else:
+                  unrecoverable.append(describe(number, problems))
+          for line in unrecoverable + rerunnable:
+              print(f"An earlier boot did not complete: {line}", file=sys.stderr)
+          if unrecoverable:
+              print(
+                  "A stage before modules-final failed, which a rerun does not repeat. "
+                  "Rebuild the guest.",
+                  file=sys.stderr,
+              )
+          elif rerunnable:
+              print(
+                  "No rerun of the bootstrap covers it. Run cloud-init-rerun-bootstrap "
+                  "and reboot.",
+                  file=sys.stderr,
+              )
+          return 1 if unrecoverable or rerunnable else 0
+
+
+      def eligible():
+          current = load(STATUS)
+          if isinstance(current, dict) and isinstance(current.get("v1"), dict):
+              if current["v1"].get("stage"):
+                  print("cloud-init is still running on this boot", file=sys.stderr)
+                  return 1
+          boots = archived_boots()
+          number = boots[-1][0] + 1 if boots else 1
+          refused = [
+              describe(boot, problems)
+              for boot, problems in boots + [(number, stage_problems(current))]
+              if set(problems) - {RERUN_STAGE}
+          ]
+          for line in refused:
+              print(f"Not repairable by a rerun: {line}", file=sys.stderr)
+          if refused:
+              print(
+                  "A rerun repeats only modules-final. Rebuild the guest.",
+                  file=sys.stderr,
+              )
+              return 1
+          print(number)
+          return 0
+
+
+      COMMANDS = {
+          "archive": archive,
+          "verify": verify,
+          "eligible": eligible,
+          "approved-deprecation": lambda: print(APPROVED_DEPRECATION) or 0,
+      }
+
+      if __name__ == "__main__":
+          os.umask(0o077)
+          if len(sys.argv) != 2 or sys.argv[1] not in COMMANDS:
+              print(__doc__, file=sys.stderr)
+              sys.exit(2)
+          sys.exit(COMMANDS[sys.argv[1]]())
+
+  # ExecStartPre runs before this unit's shim tells cloud-init's main process to
+  # start init-local, which is where status.json is deleted. That holds in both
+  # single-process and per-stage cloud-init. A drop-in rather than an enabled unit:
+  # write_files puts it in place on the first boot even when that boot never reaches
+  # the finalizer, and the boot after an interrupted one is the one that needs it.
+  # `-` because a failed archive must not stop cloud-init from running at all.
+  - path: /etc/systemd/system/cloud-init-local.service.d/10-kasa-bootstrap-history.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Service]
+      ExecStartPre=-/usr/local/sbin/cloud-init-bootstrap-history archive
+
+  - path: /usr/local/sbin/cloud-init-rerun-bootstrap
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      # Rerun this instance's bootstrap on the next boot, after a first boot that was
+      # interrupted or failed in cloud-init's final stage.
+      #
+      # cloud-init takes a per-instance module's semaphore before the module runs and
+      # never releases it, not when the module fails and not when the boot is cut off.
+      # So neither a reboot nor `cloud-init modules --mode final` reruns the package
+      # stage or the finalizer. `cloud-init single` does, but it never writes
+      # cloud-init's status, which goes on reporting the original failure. This clears
+      # the final stage's semaphores so the next boot runs that stage again under
+      # cloud-init's own status, and cloud-init-post-verify judges the result.
+      #
+      # It does not reboot. It never runs `cloud-init clean`, which would regenerate the
+      # SSH host keys and discard this instance's records, and never writes boot-success.
+      set -Eeuo pipefail
+      umask 077
+
+      instance_dir=/var/lib/cloud/instance
+      history=/usr/local/sbin/cloud-init-bootstrap-history
+
+      if [ "$(id -u)" -ne 0 ]; then
+        echo "cloud-init-rerun-bootstrap must run as root" >&2
+        exit 1
+      fi
+      if [ -e "$instance_dir/boot-success" ]; then
+        echo "This instance's bootstrap is already verified; there is nothing to rerun" >&2
+        exit 1
+      fi
+      boot_number="$("$history" eligible)"
+
+      final_semaphores="$(
+        /usr/bin/python3 -c '
+      from cloudinit import util
+
+      config = util.read_conf_with_confd("/etc/cloud/cloud.cfg")
+      for module in config.get("cloud_final_modules") or []:
+          if isinstance(module, dict):
+              module = module.get("name")
+          elif isinstance(module, list):
+              module = module[0] if module else None
+          if isinstance(module, str) and module.strip():
+              print("config_" + module.strip().replace("-", "_"))
+      '
+      )"
+      if ! grep -Fxq config_scripts_user <<<"$final_semaphores"; then
+        echo "scripts_user is not in cloud_final_modules; a rerun would skip the finalizer" >&2
+        exit 1
+      fi
+      # The package stage's `apt-get update` runs under a per-instance semaphore of its
+      # own, not the module's. Left in place, the rerun installs from whatever package
+      # lists the interrupted boot left behind. On an Ubuntu 24.04 clone shut down during
+      # that update on 2026-09-24, apt then did not know qemu-guest-agent or fail2ban.
+      final_semaphores+=$'\nupdate_sources'
+
+      # Everything this boot knows, before anything changes it. The finalizer's own
+      # report in /home/admin/logs is rewritten by the next failure, and a -syslog
+      # profile's journal does not survive the reboot this is preparing for.
+      evidence="$instance_dir/kasa-recovery/$(date -u +%Y%m%dT%H%M%SZ)"
+      install -d -m 0700 "$evidence"
+      cp -p /var/lib/cloud/data/status.json "$evidence/"
+      [ ! -f /var/lib/cloud/data/result.json ] || cp -p /var/lib/cloud/data/result.json "$evidence/"
+      [ ! -d /home/admin/logs ] || cp -pR /home/admin/logs "$evidence/admin-logs"
+      ls -l --time-style=full-iso "$instance_dir/sem" > "$evidence/semaphores.txt"
+      cat /proc/sys/kernel/random/boot_id > "$evidence/boot_id"
+      dpkg_audit_exit=0
+      dpkg --audit > "$evidence/dpkg-audit.txt" 2>&1 || dpkg_audit_exit="$?"
+      journalctl -b -o short-iso --no-pager \
+        -u cloud-init-main.service \
+        -u cloud-init-local.service \
+        -u cloud-init-network.service \
+        -u cloud-config.service \
+        -u cloud-final.service \
+        -u cloud-init-post-verify.service \
+        > "$evidence/journal.txt" 2>&1 || true
+
+      # dpkg exits 2 when it cannot read its own database, as opposed to 1 for packages
+      # left half-configured. A hard power-off can do that: on an Ubuntu 24.04 clone
+      # stopped 60 s into its first boot on 2026-09-24, ext4 had committed the sizes of
+      # every file under /var/lib/dpkg/updates but none of their contents, so all of
+      # them read back as NULs. That is a damaged package database, not an unfinished
+      # run, and nothing here can say which packages it describes. Refuse before
+      # anything changes.
+      if [ "$dpkg_audit_exit" -ge 2 ]; then
+        cat "$evidence/dpkg-audit.txt" >&2
+        echo "dpkg cannot read its database, so a rerun cannot be trusted. Rebuild the guest. Evidence kept in $evidence." >&2
+        exit 1
+      fi
+
+      # A boot cut off inside dpkg leaves packages half-configured, and apt then refuses
+      # to start, including in the package stage this is about to rerun. Finishing the
+      # interrupted run is dpkg's own recovery; on a clean system it does nothing.
+      if ! DEBIAN_FRONTEND=noninteractive dpkg --configure -a --force-confdef --force-confold; then
+        echo "dpkg --configure -a failed, so a rerun would fail the same way. Rebuild the guest. Evidence kept in $evidence." >&2
+        exit 1
+      fi
+
+      # The record first: if clearing stops partway, the next verifier still knows a
+      # rerun was requested and which boots it covers.
+      {
+        printf 'superseded_through=%s\n' "$boot_number"
+        printf 'requested_at=%s\n' "$(date --iso-8601=seconds)"
+        printf 'evidence=%s\n' "$evidence"
+      } > "$instance_dir/kasa-bootstrap-rerun"
+      while IFS= read -r semaphore; do
+        rm -f -- "$instance_dir/sem/$semaphore"
+      done <<<"$final_semaphores"
+      rm -f "$instance_dir/bootstrap-precheck-ok"
+
+      logger -t kasa-bootstrap -p daemon.notice \
+        "KASA bootstrap rerun requested through boot ${boot_number}; evidence in ${evidence}" \
+        || true
+      echo "Evidence kept in $evidence."
+      echo "Reboot to rerun the final stage: systemctl reboot"
+
   - path: /usr/local/sbin/cloud-init-post-verify
     owner: root:root
     permissions: "0755"
@@ -635,7 +972,7 @@ write_files:
 
       success_marker=/var/lib/cloud/instance/boot-success
       precheck_marker=/var/lib/cloud/instance/bootstrap-precheck-ok
-      approved_deprecation="'user' of type string is deprecated in 22.2 and scheduled to be removed in 27.2. Use 'users' list instead."
+      history=/usr/local/sbin/cloud-init-bootstrap-history
       rm -f "$success_marker"
 
       on_error() {
@@ -661,6 +998,19 @@ write_files:
         echo "cloud-init boot-finished marker is missing" >&2
         on_error 1 "$LINENO"
       fi
+
+      # The status read below describes this boot and no other, so it vouches for the
+      # bootstrap only on the boot the finalizer ran on. After a reboot the finalizer
+      # does not run again and the status resets to `done`. A verifier restarted then
+      # would pass on a status that never saw the bootstrap.
+      if ! grep -Fxq "boot_id=$(cat /proc/sys/kernel/random/boot_id)" "$precheck_marker"; then
+        echo "Bootstrap prechecks passed on an earlier boot, which this boot's cloud-init status does not cover. Run cloud-init-rerun-bootstrap and reboot." >&2
+        on_error 1 "$LINENO"
+      fi
+      if ! "$history" verify; then
+        on_error 1 "$LINENO"
+      fi
+      approved_deprecation="$("$history" approved-deprecation)"
 
       cloud_status_exit=0
       if cloud_status_output="$(cloud-init status --format json 2>&1)"; then
@@ -716,7 +1066,14 @@ write_files:
       touch "$success_marker"
       trap - ERR
 
-  # The marker persists into the image, so clones skip this one-time verifier.
+  # Started by cloud-init-finalize and by nothing else, which is why the unit has no
+  # [Install] section. Its verdict leans on this boot's cloud-init status, and that
+  # covers the bootstrap only on the boot the finalizer ran on. So a reboot never
+  # starts it: cloud-init skips the finalizer on later boots, and a status reset to
+  # `done` must not be mistaken for a bootstrap that passed. The verifier refuses to
+  # run on any other boot even when started by hand. Recovery is
+  # cloud-init-rerun-bootstrap followed by a reboot, which runs the finalizer, and
+  # therefore this, on a boot whose status covers it.
   - path: /etc/systemd/system/cloud-init-post-verify.service
     owner: root:root
     permissions: "0644"
@@ -762,6 +1119,41 @@ write_files:
         exit "$exit_code"
       }
       trap 'on_error "$?" "$LINENO"' ERR
+
+      # Package gate, before anything depends on a package. cloud-init takes a
+      # per-instance module's semaphore before the module runs and keeps it, so a boot
+      # cut off inside the package stage leaves that stage marked as done. The next
+      # boot skips it and runs this script against a half-installed system, where the
+      # first missing package fails some unrelated-looking line further down. Measured
+      # on github-runner01 (VM 410) on 2026-09-24: an ACPI shutdown 73 s into the first
+      # boot, mid-upgrade, surfaced on the next boot as "Unit dev-zram0.swap not
+      # found". The list is read from the configuration cloud-init was given.
+      mapfile -t baseline_packages < <(
+        /usr/bin/python3 -c '
+      import yaml
+
+      with open("/var/lib/cloud/instance/vendor-data.txt", encoding="utf-8") as stream:
+          print("\n".join(yaml.safe_load(stream)["packages"]))
+      '
+      )
+      [ "${#baseline_packages[@]}" -gt 0 ] || {
+        echo "Could not read the package list from cloud-init vendor-data" >&2
+        on_error 1 "$LINENO"
+      }
+      missing_packages=()
+      for package in "${baseline_packages[@]}"; do
+        package_state="$(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null || true)"
+        [ "$package_state" = installed ] || missing_packages+=("$package")
+      done
+      dpkg_audit="$(dpkg --audit 2>&1 || true)"
+      if [ "${#missing_packages[@]}" -gt 0 ] || [ -n "$dpkg_audit" ]; then
+        echo "The package stage did not complete on this instance." >&2
+        [ "${#missing_packages[@]}" -eq 0 ] || \
+          echo "Not installed: ${missing_packages[*]}" >&2
+        [ -z "$dpkg_audit" ] || printf 'dpkg --audit:\n%s\n' "$dpkg_audit" >&2
+        echo "Run cloud-init-rerun-bootstrap and reboot." >&2
+        on_error 1 "$LINENO"
+      fi
 
       # Proxmox-generated user-data owns the hostname; validate the guest state
       # it produced instead of the datasource metadata, which NoCloud omits.
@@ -935,6 +1327,16 @@ write_files:
 
       systemctl disable --now ssh.socket
       systemctl enable ssh.service
+      # Anything still in ssh.service's cgroup goes before sshd starts on its own. When
+      # a connection arrives during the package stage, the socket has already started
+      # ssh.service, and openssh-server's postinst restart can then leave a listener
+      # that systemd no longer tracks as the main process. The restart below failed to
+      # bind port 22, systemd removed /run/sshd under the orphan, and every later
+      # connection died with "Missing privilege separation directory". Measured on an
+      # Ubuntu 24.04 clone on 2026-09-24. Logged-in sessions are not in this cgroup:
+      # pam_systemd moves them into their session scope.
+      systemctl stop ssh.service
+      systemctl kill --kill-whom=all ssh.service 2>/dev/null || true
       systemctl restart ssh.service
       systemctl is-active --quiet ssh.service
       systemctl enable --now fstrim.timer
@@ -1109,7 +1511,8 @@ write_files:
       touch /etc/kasa-template-built
 
       install -d -m 0700 "$(dirname "$precheck_marker")"
-      touch "$precheck_marker"
+      # Names this boot, so the verifier can refuse to vouch for it from any other.
+      printf 'boot_id=%s\n' "$(cat /proc/sys/kernel/random/boot_id)" > "$precheck_marker"
       systemctl start --no-block cloud-init-post-verify.service
       trap - ERR
 

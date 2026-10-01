@@ -213,7 +213,7 @@ create_template() {
     --balloon "$MEM_MIN" \
     --net0 "$net0" \
     --scsihw virtio-scsi-single \
-    --machine pc \
+    --machine q35 \
     --bios ovmf \
     --efidisk0 "${VM_STORAGE_NAME}:1,efitype=4m,pre-enrolled-keys=0" \
     --serial0 socket \

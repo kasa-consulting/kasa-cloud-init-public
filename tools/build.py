@@ -397,26 +397,10 @@ def validate_generated_command(
             "model; a host-model template will not migrate"
         )
 
-    # i440fx on every release. Chosen for the widest guest compatibility, and it
-    # is the part of this profile with a real cost: i440fx exposes no PCIe root,
-    # so a guest that later needs a passed-through device wants q35 instead.
-    #
-    # The literal is "pc", which is Proxmox's name for the i440fx machine and the
-    # only spelling of it the API accepts -- `--machine i440fx` is rejected at
-    # create time with "machine.type: value does not match the regex pattern",
-    # which is a failure the build must catch rather than the node.
-    if "--machine pc" not in command:
-        fail(
-            "generated Proxmox command must use the i440fx machine type, spelled "
-            "as Proxmox spells it: --machine pc"
-        )
-    # Only the flag, not the word: the script explains in prose why i440fx puts
-    # the cloud-init seed on a bus the guest cannot read, and that comment is
-    # worth keeping.
-    if "--machine i440fx" in command:
-        fail("Proxmox does not accept i440fx as a machine type; use pc")
-    if "q35" in command:
-        fail("generated Proxmox command must not use the q35 machine type")
+    # q35 provides a PCIe root complex on every release (operator decision
+    # 2026-09-27). Reject duplicate or legacy machine flags as well as omissions.
+    if command.count("--machine") != 1 or not re.search(r"--machine q35\s", command):
+        fail("generated Proxmox command must use exactly one --machine q35")
 
     # UEFI, and the EFI variable store it needs. A template booted through OVMF
     # without an efidisk0 keeps its boot entries nowhere, so it survives the build

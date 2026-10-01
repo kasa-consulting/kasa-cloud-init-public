@@ -581,6 +581,114 @@ def validate_common(
         report(name, "rendered output still contains @@ placeholders")
 
 
+BOOTSTRAP_HISTORY_PATH = "/usr/local/sbin/cloud-init-bootstrap-history"
+BOOTSTRAP_HISTORY_DROP_IN = (
+    "/etc/systemd/system/cloud-init-local.service.d/10-kasa-bootstrap-history.conf"
+)
+BOOTSTRAP_RERUN_PATH = "/usr/local/sbin/cloud-init-rerun-bootstrap"
+
+
+def validate_bootstrap_recovery(profile: Profile, document: dict) -> None:
+    """boot-success must describe the whole bootstrap, not the boot it was written on.
+
+    cloud-init resets its status on every boot and never reruns a per-instance module
+    whose semaphore exists, even one that failed or was cut off. Each check here closes
+    one way a guest whose bootstrap never completed could still earn boot-success.
+    """
+    name = profile.name
+    files = files_by_path(document)
+
+    finalize = strip_comments(
+        files.get("/usr/local/sbin/cloud-init-finalize", {}).get("content", "")
+    )
+    gate = finalize.find("/var/lib/cloud/instance/vendor-data.txt")
+    first_unit = finalize.find("systemctl ")
+    if gate < 0 or "dpkg --audit" not in finalize:
+        report(name, "finalize must check the vendor-data package list and dpkg --audit")
+    elif first_unit >= 0 and gate > first_unit:
+        report(name, "finalize must check packages before it starts any unit")
+    if (
+        'printf \'boot_id=%s\\n\' "$(cat /proc/sys/kernel/random/boot_id)" '
+        '> "$precheck_marker"'
+    ) not in finalize:
+        report(name, "finalize must record the boot it passed on in the precheck marker")
+    # The gate asks dpkg-query for each entry by name, so a version pin or a list form
+    # would read as "not installed" on a healthy guest and fail every boot.
+    for package in document.get("packages", []):
+        if not isinstance(package, str) or not re.fullmatch(r"[a-z0-9][a-z0-9+.-]+", package):
+            report(name, f"packages entry must be a plain package name: {package!r}")
+
+    post_verify = strip_comments(
+        files.get("/usr/local/sbin/cloud-init-post-verify", {}).get("content", "")
+    )
+    if '"boot_id=$(cat /proc/sys/kernel/random/boot_id)" "$precheck_marker"' not in (
+        post_verify
+    ):
+        report(name, "post-verify must refuse a precheck marker from another boot")
+    if '"$history" verify' not in post_verify:
+        report(name, "post-verify must judge the earlier boots of this instance")
+    # One definition, in the history helper, so the verifier and the rerun tool cannot
+    # disagree about which recoverable error is acceptable.
+    if "of type string is deprecated" in post_verify:
+        report(name, "post-verify must take the approved deprecation from the helper")
+
+    service = files.get(
+        "/etc/systemd/system/cloud-init-post-verify.service", {}
+    ).get("content", "")
+    if "[Install]" in service:
+        report(
+            name,
+            "post-verify must be started only by the finalizer; a boot target would "
+            "run it on a boot whose status never saw the bootstrap",
+        )
+
+    history = files.get(BOOTSTRAP_HISTORY_PATH, {})
+    if not history:
+        report(name, f"missing required file: {BOOTSTRAP_HISTORY_PATH}")
+    else:
+        if history.get("permissions") != "0755":
+            report(name, f"{BOOTSTRAP_HISTORY_PATH} must be executable")
+        # cloud-init 26.1 records a SIGTERM'd stage as finished, so boot-finished is the
+        # only record that an earlier boot reached its end.
+        if 'INSTANCE / "boot-finished"' not in history.get("content", ""):
+            report(name, "the status archive must record whether each boot finished")
+        try:
+            compile(history.get("content", ""), BOOTSTRAP_HISTORY_PATH, "exec")
+        except SyntaxError as error:
+            report(name, f"{BOOTSTRAP_HISTORY_PATH} is not valid Python: {error}")
+
+    drop_in = files.get(BOOTSTRAP_HISTORY_DROP_IN, {}).get("content", "")
+    if f"ExecStartPre=-{BOOTSTRAP_HISTORY_PATH} archive" not in drop_in:
+        report(name, "each boot's status must be archived before init-local resets it")
+
+    rerun = files.get(BOOTSTRAP_RERUN_PATH, {})
+    if not rerun:
+        report(name, f"missing required file: {BOOTSTRAP_RERUN_PATH}")
+        return
+    rerun_code = strip_comments(rerun.get("content", ""))
+    for required in (
+        '"$history" eligible',
+        "cloud_final_modules",
+        "kasa-bootstrap-rerun",
+        'rm -f -- "$instance_dir/sem/$semaphore"',
+        # dpkg exits 2 when its own database is unreadable; a rerun cannot repair that.
+        'if [ "$dpkg_audit_exit" -ge 2 ]; then',
+        # apt-get update has a per-instance semaphore of its own.
+        "update_sources",
+    ):
+        if required not in rerun_code:
+            report(name, f"rerun tool is missing: {required}")
+    # A rerun that wrote its own verdict, rebooted on its own, or wiped the instance
+    # would each defeat the point of letting cloud-init and the verifier judge it.
+    for forbidden in ("cloud-init clean", "touch ", "/sem/*"):
+        if forbidden in rerun_code:
+            report(name, f"rerun tool must not contain: {forbidden.strip()}")
+    for line in rerun_code.splitlines():
+        command = line.strip()
+        if re.match(r"(systemctl\s+)?(reboot|poweroff|shutdown|halt|kexec)\b", command):
+            report(name, f"rerun tool must leave the reboot to the operator: {command}")
+
+
 def validate_image_release(
     profile: Profile, document: dict, release: str = DEFAULT_RELEASE
 ) -> None:
@@ -1130,6 +1238,8 @@ def validate_release_specific(
     for fragment in (
         "systemctl disable --now ssh.socket",
         "systemctl enable ssh.service",
+        # A listener orphaned by openssh-server's postinst holds port 22 otherwise.
+        "systemctl kill --kill-whom=all ssh.service",
         "systemctl restart ssh.service",
     ):
         if fragment not in finalize:
@@ -1928,6 +2038,18 @@ def validate_lxc_features(profile: Profile, command: str) -> None:
         report(name, "the LXC create script must not accept a destructive replace flag")
     if "pct destroy" in command:
         report(name, "the LXC create script must not destroy a container")
+    # Operator decision 2026-09-29: --no-start creates the container with onboot 0,
+    # so a node reboot cannot start it before its guest firewall exists.
+    if not re.search(r'^\s*--onboot "\$ONBOOT" \\$', command, re.MULTILINE) \
+            or not re.search(r"^\s*yes\) ONBOOT=0 ;;$", command, re.MULTILINE) \
+            or re.search(r"^\s*--onboot\s+1\b", command, re.MULTILINE):
+        report(
+            name,
+            "the LXC create script must create a --no-start container with onboot 0 "
+            '(ONBOOT=0 under --no-start, and --onboot "$ONBOOT" on pct create)',
+        )
+    if "expected $ONBOOT" not in command:
+        report(name, "the LXC create script must read onboot back from pct config")
     # Being active is not the same as accepting container volumes. Proxmox's
     # default `local` carries iso,vztmpl,backup and no rootdir, so a script that
     # checked only availability would fail later, inside pct create.
@@ -2238,6 +2360,7 @@ def main() -> int:
             continue
 
         validate_common(profile, document, content, arguments.release)
+        validate_bootstrap_recovery(profile, document)
         validate_ssh_source_restriction(profile, document)
         validate_strict_rp_filter(profile, document)
         validate_image_release(profile, document, arguments.release)
