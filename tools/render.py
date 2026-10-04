@@ -42,6 +42,7 @@ SITE_KEYS = {
     "BRIDGE",
     "SYSLOG_SERVER",
     "SYSLOG_PORT",
+    "SYSLOG_TLS_NAME",
     "FAIL2BAN_IGNORE_IPS",
     "TIMEZONE",
     "APPDATA_WWN",
@@ -100,8 +101,11 @@ TRUST_KEYS = frozenset(TRUST_KEY_DEFAULTS)
 # missing key must mean "untagged on BRIDGE" -- the behaviour every template built so far
 # already has -- rather than fail a build that worked yesterday. It is the VM counterpart
 # of LXC_VLAN_TAG and is validated the same way.
+# The TLS identity defaults to a DNS collector address. IP targets must supply
+# a certificate DNS name explicitly; a missing value never selects plaintext.
 NETWORK_KEY_DEFAULTS = {
     "VLAN_TAG": "",
+    "SYSLOG_TLS_NAME": "",
 }
 NETWORK_KEYS = frozenset(NETWORK_KEY_DEFAULTS)
 
@@ -133,6 +137,7 @@ OPTIONAL_EMPTY_KEYS = frozenset(
         "LXC_VLAN_TAG",
         "LXC_NAMESERVER",
         "VLAN_TAG",
+        "SYSLOG_TLS_NAME",
     }
 )
 
@@ -458,6 +463,22 @@ def load_config(profiles: tuple[Profile, ...]) -> dict[str, str]:
             raise ValueError(
                 f"{CONFIG_FILE}: SYSLOG_SERVER is not a valid IP address or hostname"
             ) from None
+
+    # A connection address may be an IP, but TLS authenticates a DNS identity.
+    values["SYSLOG_TLS_NAME"] = values["SYSLOG_TLS_NAME"] or values["SYSLOG_SERVER"]
+    peer = values["SYSLOG_TLS_NAME"]
+    try:
+        ipaddress.ip_address(peer)
+    except ValueError:
+        pass
+    else:
+        raise ValueError(
+            f"{CONFIG_FILE}: SYSLOG_TLS_NAME must be the collector certificate DNS name"
+        )
+    if not _valid_hostname(peer):
+        raise ValueError(
+            f"{CONFIG_FILE}: SYSLOG_TLS_NAME must be an exact DNS name, without wildcards"
+        )
 
     try:
         syslog_port = int(values["SYSLOG_PORT"])
@@ -836,6 +857,13 @@ def profile_flags(profile: Profile) -> dict[str, bool]:
     }
 
 
+def syslog_tls_endpoint() -> str:
+    """OpenSSL requires brackets around an IPv6 connection address."""
+    server = SITE["SYSLOG_SERVER"]
+    address = f"[{server}]" if ":" in server else server
+    return f'{address}:{SITE["SYSLOG_PORT"]}'
+
+
 def render(profile: Profile, release: str = DEFAULT_RELEASE, **extra: str) -> str:
     """Render one profile's cloud-config in memory."""
     load_release(release)
@@ -846,6 +874,8 @@ def render(profile: Profile, release: str = DEFAULT_RELEASE, **extra: str) -> st
         "@@FAIL2BAN_IGNORE_IPS@@": SITE["FAIL2BAN_IGNORE_IPS"],
         "@@SYSLOG_SERVER@@": SITE["SYSLOG_SERVER"],
         "@@SYSLOG_PORT@@": SITE["SYSLOG_PORT"],
+        "@@SYSLOG_TLS_NAME@@": SITE["SYSLOG_TLS_NAME"],
+        "@@SYSLOG_TLS_ENDPOINT@@": syslog_tls_endpoint(),
         "@@TIMEZONE@@": SITE["TIMEZONE"],
         "@@APPDATA_WWN@@": SITE["APPDATA_WWN"],
         "@@APPDATA_SERIAL@@": SITE["APPDATA_SERIAL"],
@@ -880,6 +910,8 @@ def render_lxc(profile: Profile, release: str = DEFAULT_RELEASE, **extra: str) -
         "@@FAIL2BAN_IGNORE_IPS@@": SITE["FAIL2BAN_IGNORE_IPS"],
         "@@SYSLOG_SERVER@@": SITE["SYSLOG_SERVER"],
         "@@SYSLOG_PORT@@": SITE["SYSLOG_PORT"],
+        "@@SYSLOG_TLS_NAME@@": SITE["SYSLOG_TLS_NAME"],
+        "@@SYSLOG_TLS_ENDPOINT@@": syslog_tls_endpoint(),
         "@@TIMEZONE@@": SITE["TIMEZONE"],
         "@@APPDATA_MOUNT@@": APPDATA_MOUNT,
         "@@SSH_ALLOW_USERS_DIRECTIVE@@": _ssh_allow_users_directive(),

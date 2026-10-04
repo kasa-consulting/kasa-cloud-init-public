@@ -772,14 +772,23 @@ systemctl enable --now unattended-upgrades.service
 systemctl is-active --quiet unattended-upgrades.service \
   || fail "unattended-upgrades.service is not running"
 
+#% if remote_syslog
+apt-get install --yes --no-install-recommends rsyslog-gnutls openssl
+#% endif
+
 # --- Logging -----------------------------------------------------------------
 
 #% if remote_syslog
 # This runs against a live container, not a template build boot, so an
 # unreachable collector is fatal. Check it before switching the journal to
 # memory: committing first would leave a container logging nowhere at all.
-if ! timeout 5 bash -c "</dev/tcp/@@SYSLOG_SERVER@@/@@SYSLOG_PORT@@" 2>/dev/null; then
-  fail "syslog collector @@SYSLOG_SERVER@@:@@SYSLOG_PORT@@ is unreachable; this profile has no local durable copy"
+if ! timeout 10 openssl s_client \
+  -connect "@@SYSLOG_TLS_ENDPOINT@@" \
+  -servername "@@SYSLOG_TLS_NAME@@" \
+  -CAfile /etc/ssl/certs/ca-certificates.crt \
+  -verify_hostname "@@SYSLOG_TLS_NAME@@" -verify_return_error \
+  </dev/null >/dev/null 2>&1; then
+  fail "syslog collector @@SYSLOG_SERVER@@:@@SYSLOG_PORT@@ failed TLS verification or is unreachable; this profile has no local durable copy"
 fi
 
 install_file /etc/systemd/journald.conf.d/60-remote-syslog.conf 0644 <<'EOF'
@@ -821,6 +830,13 @@ action(
   target="@@SYSLOG_SERVER@@"
   port="@@SYSLOG_PORT@@"
   protocol="tcp"
+  StreamDriver="gtls"
+  StreamDriverMode="1"
+  StreamDriverAuthMode="x509/name"
+  StreamDriverPermittedPeers="@@SYSLOG_TLS_NAME@@"
+  StreamDriver.CAFile="/etc/ssl/certs/ca-certificates.crt"
+  StreamDriver.PrioritizeSAN="on"
+  StreamDriver.CheckExtendedKeyPurpose="on"
   TCP_Framing="traditional"
   template="RSYSLOG_SyslogProtocol23Format"
   action.resumeRetryCount="-1"

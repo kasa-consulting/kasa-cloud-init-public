@@ -37,6 +37,16 @@ VM, and the partition grows automatically.
 
 Things to understand before you use these, both deliberate:
 
+Remote forwarding requires a TLS listener (normally TCP 6514) with a certificate
+trusted by the guest's system CA bundle. `SYSLOG_TLS_NAME` is the exact DNS name
+in that certificate's SAN, even when `SYSLOG_SERVER` is an IP address. An omitted
+or empty name defaults to `SYSLOG_SERVER` only when that address is a DNS name.
+Set `KASA_ROOT_CA_FILE` to an external CA certificate when the collector uses
+the KASA PKI. The payload includes only public trust anchors; forwarding uses
+server authentication without a client certificate. There is no plaintext fallback.
+Remote profiles install `rsyslog-gnutls` and `openssl`. A verified TLS handshake
+checks the endpoint at bootstrap; receipt must also be confirmed at the collector.
+
 > **Remote-syslog profiles keep system logging in memory.**
 > For the templates ending in `-syslog`, the journal is volatile, the rsyslog
 > forwarding queue has no disk spool, and fail2ban's ban database lives in
@@ -79,7 +89,7 @@ chmod 0600 tools/.env
 $EDITOR tools/.env
 ```
 
-Set at least `SYSLOG_SERVER`, `SYSLOG_PORT`, `FAIL2BAN_IGNORE_IPS`, `BRIDGE`,
+Set at least `SYSLOG_SERVER`, `SYSLOG_PORT`, `SYSLOG_TLS_NAME`, `FAIL2BAN_IGNORE_IPS`, `BRIDGE`,
 `VMID_START`, and `SSH_PUBLIC_KEY_FILE`. `VMID_START` must begin a range of
 unused VM IDs — one per profile in `templates/profiles.yaml`. If you configure SSH source
 authorization, use exact `admin@IP` entries in `SSH_ALLOW_USERS`.
@@ -310,7 +320,7 @@ or only for rootless Docker. See
 | Updates | Distribution unattended-upgrades policy, enabled daily with no automatic reboot | `/etc/apt/apt.conf.d/20auto-upgrades` |
 | Swap | Debian: zram only, `min(ram / 2, 512)` with zstd and `vm.swappiness = 100`; Ubuntu: none | Debian: `/etc/systemd/zram-generator.conf` |
 | Disk | Root grows on first boot, `fstrim.timer` enabled | cloud-init `growpart` |
-| Remote syslog | Volatile journal forwarded to `SYSLOG_SERVER:SYSLOG_PORT` over plain TCP, memory-only queue | `/etc/rsyslog.d/01-remote.conf` |
+| Remote syslog | Volatile journal forwarded to `SYSLOG_SERVER:SYSLOG_PORT` over authenticated TLS, memory-only queue | `/etc/rsyslog.d/01-remote.conf` |
 | Local logging | profiles without `-syslog` use normal disk-backed rsyslog files and persistent fail2ban state | Distribution package defaults |
 | `/var/log` | Persistent on every profile; never a tmpfs, so package-created log directories survive a reboot | Distribution package defaults |
 | Docker | Rootless, `data-root` on `/mnt/appdata/docker`, journald log driver | `~admin/.config/docker/daemon.json` |
@@ -721,7 +731,6 @@ that I understand and have the ability to maintain.
 
 ## To do
 
-- Replace plain TCP syslog with authenticated TLS or RELP.
 - Benchmark `pasta` against `slirp4netns` and pin the faster one.
 - Confirm `live-restore` behaves under rootless, and re-add it if so.
 

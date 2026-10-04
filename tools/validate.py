@@ -129,6 +129,12 @@ REQUIRED_RSYSLOG_FRAGMENTS = (
     'Ratelimit.Burst="25000"',
     'type="omfwd"',
     'protocol="tcp"',
+    'StreamDriver="gtls"',
+    'StreamDriverMode="1"',
+    'StreamDriverAuthMode="x509/name"',
+    'StreamDriver.CAFile="/etc/ssl/certs/ca-certificates.crt"',
+    'StreamDriver.PrioritizeSAN="on"',
+    'StreamDriver.CheckExtendedKeyPurpose="on"',
     'TCP_Framing="traditional"',
     'template="RSYSLOG_SyslogProtocol23Format"',
     'queue.type="LinkedList"',
@@ -145,16 +151,6 @@ FORBIDDEN_RSYSLOG_FRAGMENTS = (
     "queue.maxDiskSpace",
     "workDirectory",
     "/var/spool/",
-)
-
-# Plain TCP is a deliberate, documented choice. A half-configured TLS setup is
-# worse than none, so adding any of these must be an explicit, reviewed change.
-FORBIDDEN_TLS_FRAGMENTS = (
-    "DefaultNetstreamDriverCAFile",
-    "StreamDriver",
-    "x509/",
-    "ossl",
-    "gtls",
 )
 
 errors: list[str] = []
@@ -734,6 +730,18 @@ def validate_image_release(
             report(name, f"/etc/kasa-image-release {field} does not match {release}")
 
 
+def validate_syslog_tls_probe(name: str, script: str) -> None:
+    for fragment in (
+        "timeout 10 openssl s_client",
+        f'-connect "{render_module.syslog_tls_endpoint()}"',
+        f'-servername "{SITE["SYSLOG_TLS_NAME"]}"',
+        "-CAfile /etc/ssl/certs/ca-certificates.crt",
+        f'-verify_hostname "{SITE["SYSLOG_TLS_NAME"]}" -verify_return_error',
+    ):
+        if fragment not in strip_comments(script):
+            report(name, f"syslog TLS probe is missing {fragment}")
+
+
 def validate_rsyslog(profile: Profile, document: dict) -> None:
     name = profile.name
     content = files_by_path(document).get("/etc/rsyslog.d/01-remote.conf", {}).get(
@@ -748,6 +756,7 @@ def validate_rsyslog(profile: Profile, document: dict) -> None:
         report(name, "remote syslog forwarding is not configured")
         return
 
+    content = strip_comments(content)
     for fragment in REQUIRED_RSYSLOG_FRAGMENTS:
         if fragment not in content:
             report(name, f"rsyslog forwarder is missing {fragment}")
@@ -762,9 +771,15 @@ def validate_rsyslog(profile: Profile, document: dict) -> None:
     for fragment in FORBIDDEN_RSYSLOG_FRAGMENTS:
         if fragment in body:
             report(name, f"rsyslog must not spool to disk: found {fragment}")
-    for fragment in FORBIDDEN_TLS_FRAGMENTS:
-        if fragment in body:
-            report(name, f"rsyslog TLS is not configured here: found {fragment}")
+    if f'StreamDriverPermittedPeers="{SITE["SYSLOG_TLS_NAME"]}"' not in body:
+        report(name, "rsyslog TLS peer does not match SYSLOG_TLS_NAME")
+    packages = set(document.get("packages", []))
+    if not {"rsyslog-gnutls", "openssl", "ca-certificates"} <= packages:
+        report(name, "remote syslog requires rsyslog-gnutls, openssl and ca-certificates")
+    finalize = files_by_path(document).get(
+        "/usr/local/sbin/cloud-init-finalize", {}
+    ).get("content", "")
+    validate_syslog_tls_probe(name, finalize)
 
 
 def _mount_unit_is_var_log_tmpfs(content: str) -> bool:
@@ -872,7 +887,7 @@ def validate_remote_syslog(
             "systemctl restart systemd-journald.service",
             "/run/rsyslog/imjournal.state",
             "remote syslog forwarding smoke test",
-            "</dev/tcp/",
+            "openssl s_client",
         ):
             if forbidden in finalize:
                 report(
@@ -923,6 +938,7 @@ def validate_remote_syslog(
             "@{run}/log/journal/*/** r,",
             "@{run}/rsyslog/ rw,",
             "@{run}/rsyslog/** rwk,",
+            "/etc/ssl/certs/ca-certificates.crt r,",
         ):
             if rule not in apparmor:
                 report(name, f"Ubuntu rsyslog AppArmor exception is missing: {rule}")
@@ -1686,7 +1702,7 @@ def validate_lxc_logging(profile: Profile, bootstrap: str) -> None:
             report(name, "a local-logging LXC profile must keep fail2ban state on disk")
         if "Storage=volatile" in body:
             report(name, "a local-logging LXC profile must not make the journal volatile")
-        if "/dev/tcp/" in body:
+        if "openssl s_client" in body or "/dev/tcp/" in body:
             report(name, "a local-logging LXC profile must not probe a collector")
         return
 
@@ -1694,6 +1710,7 @@ def validate_lxc_logging(profile: Profile, bootstrap: str) -> None:
         report(name, "a remote-syslog LXC profile must write /etc/rsyslog.d/01-remote.conf")
         return
 
+    remote = strip_comments(remote)
     for fragment in REQUIRED_RSYSLOG_FRAGMENTS:
         if fragment not in remote:
             report(name, f"LXC remote rsyslog config is missing: {fragment}")
@@ -1703,9 +1720,10 @@ def validate_lxc_logging(profile: Profile, bootstrap: str) -> None:
                 name,
                 f"LXC remote rsyslog config must not spool to disk: found {fragment}",
             )
-    for fragment in FORBIDDEN_TLS_FRAGMENTS:
-        if fragment in remote:
-            report(name, f"LXC remote rsyslog config must not configure TLS: {fragment}")
+    if f'StreamDriverPermittedPeers="{SITE["SYSLOG_TLS_NAME"]}"' not in remote:
+        report(name, "LXC rsyslog TLS peer does not match SYSLOG_TLS_NAME")
+    if not {"rsyslog-gnutls", "openssl", "ca-certificates"} <= lxc_installed_packages(bootstrap):
+        report(name, "LXC remote syslog requires rsyslog-gnutls, openssl and ca-certificates")
     if f'target="{SITE["SYSLOG_SERVER"]}"' not in remote:
         report(name, "LXC remote rsyslog target does not match the configured collector")
     if f'port="{SITE["SYSLOG_PORT"]}"' not in remote:
@@ -1728,10 +1746,10 @@ def validate_lxc_logging(profile: Profile, bootstrap: str) -> None:
     if not re.search(r"(?mi)^\s*logtarget\s*=\s*SYSTEMD-JOURNAL", fail2ban_local):
         report(name, "a remote-syslog LXC profile must send fail2ban logs to the journal")
 
+    validate_syslog_tls_probe(name, body)
+
     # The container is live, not a template being built, so an unreachable
     # collector has to stop the run before the journal goes volatile.
-    if "/dev/tcp/" not in body:
-        report(name, "a remote-syslog LXC profile must test collector reachability")
     if "/run/rsyslog/imjournal.state" not in body:
         report(name, "a remote-syslog LXC profile must verify the imjournal state file")
 

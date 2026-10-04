@@ -335,6 +335,13 @@ write_files:
         target="@@SYSLOG_SERVER@@"
         port="@@SYSLOG_PORT@@"
         protocol="tcp"
+        StreamDriver="gtls"
+        StreamDriverMode="1"
+        StreamDriverAuthMode="x509/name"
+        StreamDriverPermittedPeers="@@SYSLOG_TLS_NAME@@"
+        StreamDriver.CAFile="/etc/ssl/certs/ca-certificates.crt"
+        StreamDriver.PrioritizeSAN="on"
+        StreamDriver.CheckExtendedKeyPurpose="on"
         TCP_Framing="traditional"
         template="RSYSLOG_SyslogProtocol23Format"
         action.resumeRetryCount="-1"
@@ -1442,14 +1449,18 @@ write_files:
       # On the build boot an unreachable collector is a warning, because the
       # template must still be buildable without one; on a clone it is fatal,
       # because the VM would run blind.
-      if ! timeout 5 bash -c \
-        "</dev/tcp/@@SYSLOG_SERVER@@/@@SYSLOG_PORT@@" 2>/dev/null; then
+      if ! timeout 10 openssl s_client \
+        -connect "@@SYSLOG_TLS_ENDPOINT@@" \
+        -servername "@@SYSLOG_TLS_NAME@@" \
+        -CAfile /etc/ssl/certs/ca-certificates.crt \
+        -verify_hostname "@@SYSLOG_TLS_NAME@@" -verify_return_error \
+        </dev/null >/dev/null 2>&1; then
         if [ -f /etc/kasa-template-built ]; then
-          echo "Syslog collector @@SYSLOG_SERVER@@:@@SYSLOG_PORT@@ is unreachable" >&2
+          echo "Syslog collector @@SYSLOG_SERVER@@:@@SYSLOG_PORT@@ failed TLS verification or is unreachable" >&2
           on_error 1 "$LINENO"
         fi
         echo \
-          "WARNING: syslog collector @@SYSLOG_SERVER@@:@@SYSLOG_PORT@@ is unreachable" \
+          "WARNING: syslog collector @@SYSLOG_SERVER@@:@@SYSLOG_PORT@@ failed TLS verification or is unreachable" \
           >&2
       fi
 #% endif
@@ -1473,6 +1484,10 @@ packages:
   - openssh-server
   - qemu-guest-agent
   - rsyslog
+#% if remote_syslog
+  - rsyslog-gnutls
+  - openssl
+#% endif
   - sudo
   - systemd-zram-generator
   - unattended-upgrades
