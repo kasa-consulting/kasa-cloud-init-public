@@ -782,7 +782,7 @@ apt-get install --yes --no-install-recommends rsyslog-gnutls openssl
 # This runs against a live container, not a template build boot, so an
 # unreachable collector is fatal. Check it before switching the journal to
 # memory: committing first would leave a container logging nowhere at all.
-if ! timeout 10 openssl s_client \
+if ! timeout 10 openssl s_client -brief -no_ign_eof \
   -connect "@@SYSLOG_TLS_ENDPOINT@@" \
   -servername "@@SYSLOG_TLS_NAME@@" \
   -CAfile /etc/ssl/certs/ca-certificates.crt \

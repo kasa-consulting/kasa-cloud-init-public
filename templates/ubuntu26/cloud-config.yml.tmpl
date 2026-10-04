@@ -1504,7 +1504,7 @@ write_files:
       # On the build boot an unreachable collector is a warning, because the
       # template must still be buildable without one; on a clone it is fatal,
       # because the VM would run blind.
-      if ! timeout 10 openssl s_client \
+      if ! timeout 10 openssl s_client -brief -no_ign_eof \
         -connect "@@SYSLOG_TLS_ENDPOINT@@" \
         -servername "@@SYSLOG_TLS_NAME@@" \
         -CAfile /etc/ssl/certs/ca-certificates.crt \
