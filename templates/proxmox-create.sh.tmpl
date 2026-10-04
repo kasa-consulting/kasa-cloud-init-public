@@ -62,7 +62,7 @@ require_command() {
 }
 
 [ "$(id -u)" -eq 0 ] || fail "Run these commands as root on Proxmox"
-for command in awk curl mktemp mv pvesm qm sha256sum ssh-keygen; do
+for command in awk curl flock mktemp mv pvesm qm sha256sum ssh-keygen; do
   require_command "$command"
 done
 case "$IMAGE_CHECKSUM_ALGORITHM" in
@@ -71,6 +71,11 @@ case "$IMAGE_CHECKSUM_ALGORITHM" in
   *) fail "Unsupported image checksum algorithm: $IMAGE_CHECKSUM_ALGORITHM" ;;
 esac
 require_command "$image_checksum_command"
+
+# Serialize direct invocations as well as the rollout coordinator. The coordinator
+# uses a separate lock so these generated scripts can run beneath it.
+exec 9>"/run/lock/kasa-cloud-init-create-${VMID}.lock"
+flock --nonblock 9 || fail "Another build owns template $VMID"
 
 [ -d "$ISO_STORAGE_PATH" ] || \
   fail "Proxmox ISO directory is missing: $ISO_STORAGE_PATH"
@@ -94,32 +99,6 @@ if command -v cloud-init >/dev/null 2>&1; then
   cloud-init schema --config-file "$vendor_path"
 fi
 
-# Resolve what is already at this VMID before changing anything.
-if qm config "$VMID" >/dev/null 2>&1; then
-  if [ "$replace" -ne 1 ]; then
-    fail "VMID $VMID already exists; pass --replace to rebuild it"
-  fi
-
-  existing_name="$(qm config "$VMID" | awk -F': ' '/^name: / { print $2; exit }')"
-  if [ "$existing_name" != "$NAME" ]; then
-    fail "VMID $VMID holds '$existing_name', not '$NAME'; refusing to replace it"
-  fi
-  if [ "$(qm config "$VMID" | awk -F': ' '/^template: / { print $2; exit }')" != 1 ]; then
-    fail "VMID $VMID is a live VM, not a template; refusing to replace it"
-  fi
-
-  echo "Replacing existing template $VMID ($existing_name)"
-  if ! destroy_output="$(qm destroy "$VMID" --purge 1 2>&1)"; then
-    printf '%s\n' "$destroy_output" >&2
-    case "$destroy_output" in
-      *[Ll]inked*|*[Bb]ase*volume*)
-        fail "Template $VMID still has linked clones. Remove them, or convert
-       them to full clones, before rebuilding this template."
-        ;;
-    esac
-    fail "Could not destroy the existing template $VMID"
-  fi
-fi
 
 image_path="${ISO_STORAGE_PATH}/${IMAGE_NAME}"
 image_temp=""
@@ -182,6 +161,34 @@ if [ "$image_needs_download" -eq 1 ]; then
   image_temp=""
 fi
 printf '%s  %s\n' "$IMAGE_CHECKSUM" "$image_path" | "$image_checksum_command" --check -
+
+# Resolve what is already at this VMID before changing anything.
+if qm config "$VMID" >/dev/null 2>&1; then
+  if [ "$replace" -ne 1 ]; then
+    fail "VMID $VMID already exists; pass --replace to rebuild it"
+  fi
+
+  existing_name="$(qm config "$VMID" | awk -F': ' '/^name: / { print $2; exit }')"
+  if [ "$existing_name" != "$NAME" ]; then
+    fail "VMID $VMID holds '$existing_name', not '$NAME'; refusing to replace it"
+  fi
+  if [ "$(qm config "$VMID" | awk -F': ' '/^template: / { print $2; exit }')" != 1 ]; then
+    fail "VMID $VMID is a live VM, not a template; refusing to replace it"
+  fi
+
+  echo "Replacing existing template $VMID ($existing_name)"
+  if ! destroy_output="$(qm destroy "$VMID" --purge 1 2>&1)"; then
+    printf '%s\n' "$destroy_output" >&2
+    case "$destroy_output" in
+      *[Ll]inked*|*[Bb]ase*volume*)
+        fail "Template $VMID still has linked clones. Remove them, or convert
+       them to full clones, before rebuilding this template."
+        ;;
+    esac
+    fail "Could not destroy the existing template $VMID"
+  fi
+fi
+
 
 #% if ssh_public_key
 # Proxmox reads the keys from a file and folds them into the user-data it

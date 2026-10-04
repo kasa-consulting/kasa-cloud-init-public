@@ -7,6 +7,7 @@ import argparse
 from dataclasses import dataclass
 import datetime
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -748,6 +749,43 @@ def build(release: str) -> None:
         )
         for container in containers
     ]
+
+    # Machine-readable inputs for the rollout coordinator. This deliberately lists
+    # public execution inputs only, never the complete site environment or key values.
+    configuration = {key: value for key, value in CONFIG.items()
+                     if key not in {"VMID_START", "NAME_PREFIX", "ARTIFACT_OUTPUT_DIR"}}
+    manifest = {
+        "version": 1, "release": release, "provenance": provenance,
+        "configuration_sha256": sha256(json.dumps(configuration, sort_keys=True) + public_key
+                                     + (resolve_config_path(CONFIG["KASA_ROOT_CA_FILE"]).read_text()
+                                        if CONFIG["KASA_ROOT_CA_FILE"] else "")),
+        "cpu": CONFIG["CPU_TYPE"],
+        "network": {"bridge": CONFIG["BRIDGE"], "vlan_tag": CONFIG["VLAN_TAG"],
+                    "queues": CONFIG["CPU"]},
+        "disks_gib": {"root": int(CONFIG["ROOT_DISK_SIZE"]),
+                      "appdata": int(CONFIG["APPDATA_DISK_SIZE"])},
+        "ssh": {"allow_users": CONFIG["SSH_ALLOW_USERS"],
+                "user_ca_sha256": sha256(CONFIG["SSH_USER_CA_PUBLIC_KEY"] + "\n")
+                                  if CONFIG["SSH_USER_CA_PUBLIC_KEY"] else ""},
+        "image": {"name": image.name, "algorithm": image.checksum_algorithm,
+                  "checksum": image.checksum, "url": image.url},
+        "os": {"id": release_info.os, "version": release_info.version},
+        "storage": CONFIG["SNIPPET_STORAGE_NAME"],
+        "vm_storage": CONFIG["VM_STORAGE_NAME"],
+        "iso_directory": CONFIG["ISO_STORAGE_PATH"],
+        "syslog": {key: CONFIG[key] for key in
+                   ("SYSLOG_SERVER", "SYSLOG_PORT", "SYSLOG_TLS_NAME")},
+        "templates": [
+            {"profile": profile.name, "vmid": vendor.vmid,
+             "name": vendor.template_name, "remote_syslog": profile.remote_syslog,
+             "docker": profile.docker, "vendor": vendor.filename,
+             "vendor_sha256": vendor.digest, "script": name,
+             "script_sha256": sha256(command)}
+            for profile, (name, command, vendor) in zip(PROFILES, commands)
+        ],
+    }
+    install_artifact(output_directory, "bundle.json",
+                     json.dumps(manifest, sort_keys=True, indent=2) + "\n", yaml_mode)
 
     print(f"Built template bundle for {release} ({image.name})")
     for path in paths:
