@@ -650,16 +650,97 @@ def vendor_artifacts(release: str, provenance: dict[str, str]) -> tuple[VendorAr
     for profile in PROFILES:
         vendor_data = build_vendor(profile, release, provenance)
         artifact_name = template_name(profile, release, prefix)
+        vendor_digest = sha256(vendor_data)
         artifacts.append(
             VendorArtifact(
                 vmid=vmid_start + profile.vmid_offset,
                 template_name=artifact_name,
-                filename=f"{artifact_name}-vendor.yml",
-                digest=sha256(vendor_data),
+                # Full clones retain their cicustom reference. A fresh template
+                # must not change the vendor data those existing clients read.
+                filename=f"{artifact_name}-{vendor_digest}-vendor.yml",
+                digest=vendor_digest,
                 content=vendor_data,
             )
         )
     return tuple(artifacts)
+
+
+def bundle_manifest(release, provenance, public_key, vendors, commands, containers):
+    """Describe exact artifacts and reproducible recipes through the owning renderer.
+
+    Recipe hashes render the same payload with fixed provenance values. They do
+    not remove text from an artifact or exempt any runtime setting from comparison.
+    """
+    image = load_image(release)
+    release_info = load_release(release)
+    configuration = {key: value for key, value in CONFIG.items()
+                     if key not in {"VMID_START", "NAME_PREFIX", "ARTIFACT_OUTPUT_DIR"}}
+    fixed = {"SOURCE_COMMIT": "0" * 40, "SOURCE_TREE_DIRTY": "false",
+             "BUILT_AT": "1970-01-01T00:00:00+00:00"}
+    recipes = vendor_artifacts(release, fixed)
+    manifest = {
+        "version": 1, "release": release, "release_vmid_offset": release_info.vmid_offset,
+        "provenance": provenance,
+        "configuration_sha256": sha256(json.dumps(configuration, sort_keys=True) + public_key
+                                     + (resolve_config_path(CONFIG["KASA_ROOT_CA_FILE"]).read_text()
+                                        if CONFIG["KASA_ROOT_CA_FILE"] else "")),
+        "cpu": CONFIG["CPU_TYPE"],
+        "network": {"bridge": CONFIG["BRIDGE"], "vlan_tag": CONFIG["VLAN_TAG"],
+                    "queues": CONFIG["CPU"]},
+        "disks_gib": {"root": int(CONFIG["ROOT_DISK_SIZE"]),
+                      "appdata": int(CONFIG["APPDATA_DISK_SIZE"])},
+        "ssh": {"allow_users": CONFIG["SSH_ALLOW_USERS"],
+                "user_ca_sha256": sha256(CONFIG["SSH_USER_CA_PUBLIC_KEY"] + "\n")
+                                  if CONFIG["SSH_USER_CA_PUBLIC_KEY"] else ""},
+        "image": {"name": image.name, "algorithm": image.checksum_algorithm,
+                  "checksum": image.checksum, "url": image.url},
+        "os": {"id": release_info.os, "version": release_info.version},
+        "storage": CONFIG["SNIPPET_STORAGE_NAME"],
+        "vm_storage": CONFIG["VM_STORAGE_NAME"],
+        "iso_directory": CONFIG["ISO_STORAGE_PATH"],
+        "syslog": {key: CONFIG[key] for key in
+                   ("SYSLOG_SERVER", "SYSLOG_PORT", "SYSLOG_TLS_NAME")},
+        "recipe_version": 1,
+        "templates": [],
+    }
+    for profile, (name, command, vendor), recipe in zip(PROFILES, commands, recipes):
+        stable_command = render_command(profile=profile, vendor=recipe, image=image,
+                                        public_key=public_key, release=release)
+        manifest["templates"].append({
+            "profile": profile.name, "vmid": vendor.vmid, "name": vendor.template_name,
+            "remote_syslog": profile.remote_syslog, "docker": profile.docker,
+            "vendor": vendor.filename, "vendor_sha256": vendor.digest,
+            "script": name, "script_sha256": sha256(command),
+            "recipe_sha256": sha256(recipe.content + "\0" + stable_command),
+        })
+    if containers:
+        stable_containers = lxc_artifacts(release, fixed, public_key)
+        manifest["lxc"] = {
+            "archive": load_lxc_template(release).template,
+            "templates": [
+                {"profile": profile.name, "bootstrap": container.bootstrap_filename,
+                 "bootstrap_sha256": sha256(container.bootstrap),
+                 "script": container.command_filename, "script_sha256": sha256(container.command),
+                 "recipe_sha256": sha256(stable.bootstrap + "\0" + stable.command)}
+                for profile, container, stable in zip(PROFILES, containers, stable_containers)
+            ],
+        }
+    return manifest
+
+
+def describe(release):
+    """Read-only rendering for routine preparation; never writes artifacts."""
+    image = load_image(release)
+    public_key = read_public_keys()
+    verify_root_ca()
+    provenance = source_provenance()
+    vendors = vendor_artifacts(release, provenance)
+    commands = tuple((f"create-{v.template_name}.sh",
+                      render_command(profile=p, vendor=v, image=image,
+                                     public_key=public_key, release=release), v)
+                     for p, v in zip(PROFILES, vendors))
+    containers = lxc_artifacts(release, provenance, public_key) if load_release(release).lxc else ()
+    return bundle_manifest(release, provenance, public_key, vendors, commands, containers)
 
 
 def build(release: str) -> None:
@@ -752,38 +833,7 @@ def build(release: str) -> None:
 
     # Machine-readable inputs for the rollout coordinator. This deliberately lists
     # public execution inputs only, never the complete site environment or key values.
-    configuration = {key: value for key, value in CONFIG.items()
-                     if key not in {"VMID_START", "NAME_PREFIX", "ARTIFACT_OUTPUT_DIR"}}
-    manifest = {
-        "version": 1, "release": release, "provenance": provenance,
-        "configuration_sha256": sha256(json.dumps(configuration, sort_keys=True) + public_key
-                                     + (resolve_config_path(CONFIG["KASA_ROOT_CA_FILE"]).read_text()
-                                        if CONFIG["KASA_ROOT_CA_FILE"] else "")),
-        "cpu": CONFIG["CPU_TYPE"],
-        "network": {"bridge": CONFIG["BRIDGE"], "vlan_tag": CONFIG["VLAN_TAG"],
-                    "queues": CONFIG["CPU"]},
-        "disks_gib": {"root": int(CONFIG["ROOT_DISK_SIZE"]),
-                      "appdata": int(CONFIG["APPDATA_DISK_SIZE"])},
-        "ssh": {"allow_users": CONFIG["SSH_ALLOW_USERS"],
-                "user_ca_sha256": sha256(CONFIG["SSH_USER_CA_PUBLIC_KEY"] + "\n")
-                                  if CONFIG["SSH_USER_CA_PUBLIC_KEY"] else ""},
-        "image": {"name": image.name, "algorithm": image.checksum_algorithm,
-                  "checksum": image.checksum, "url": image.url},
-        "os": {"id": release_info.os, "version": release_info.version},
-        "storage": CONFIG["SNIPPET_STORAGE_NAME"],
-        "vm_storage": CONFIG["VM_STORAGE_NAME"],
-        "iso_directory": CONFIG["ISO_STORAGE_PATH"],
-        "syslog": {key: CONFIG[key] for key in
-                   ("SYSLOG_SERVER", "SYSLOG_PORT", "SYSLOG_TLS_NAME")},
-        "templates": [
-            {"profile": profile.name, "vmid": vendor.vmid,
-             "name": vendor.template_name, "remote_syslog": profile.remote_syslog,
-             "docker": profile.docker, "vendor": vendor.filename,
-             "vendor_sha256": vendor.digest, "script": name,
-             "script_sha256": sha256(command)}
-            for profile, (name, command, vendor) in zip(PROFILES, commands)
-        ],
-    }
+    manifest = bundle_manifest(release, provenance, public_key, vendors, commands, containers)
     install_artifact(output_directory, "bundle.json",
                      json.dumps(manifest, sort_keys=True, indent=2) + "\n", yaml_mode)
 
@@ -821,8 +871,13 @@ def main() -> int:
         default=DEFAULT_RELEASE,
         help=f"OS release directory under templates/ (default: {DEFAULT_RELEASE})",
     )
+    parser.add_argument("--describe", action="store_true",
+                        help="render a read-only JSON recipe description without building artifacts")
     arguments = parser.parse_args()
-    build(arguments.release)
+    if arguments.describe:
+        print(json.dumps(describe(arguments.release), sort_keys=True))
+    else:
+        build(arguments.release)
     return 0
 
 

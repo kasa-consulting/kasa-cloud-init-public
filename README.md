@@ -110,7 +110,9 @@ and is set separately.
 ```
 
 `build/` will create one `*-vendor.yml` and one `create-*.sh` per profile. Each
-script carries the SHA-256 of its own snippet and re-verifies it on Proxmox
+vendor filename includes its content SHA256 so refreshed templates do not replace
+the snippets referenced by existing full clones. Keep old snippets until no
+guest references them. Each script carries the SHA-256 of its own snippet and re-verifies it on Proxmox
 before creating anything.
 
 ## Installing the Template on Proxmox
