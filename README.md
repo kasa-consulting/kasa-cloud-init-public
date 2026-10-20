@@ -119,6 +119,9 @@ before creating anything.
 
 Snippets go in the storage named by `SNIPPET_STORAGE_NAME`. Find that directory
 and make sure you saved the files we created with the build process there.
+Proxmox reads the vendor snippet again whenever it regenerates a clone's
+cloud-init drive. In a cluster that uses node-local storage such as `local`,
+copy each vendor snippet, unchanged, to every node a clone may start on.
 
 Then on the Proxmox host, from that directory:
 
