@@ -289,6 +289,16 @@ write_files:
       RateLimitIntervalSec=30s
       RateLimitBurst=5000
 
+  - path: /etc/systemd/journald.conf.d/syslog.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      # Masks the packaged /usr/lib/systemd/journald.conf.d/syslog.conf: Debian 13's rsyslog
+      # ships ForwardToSyslog=yes there, and it sorts after 60-remote-syslog.conf and wins.
+      # Nothing reads journald's syslog socket; rsyslog reads the journal through imjournal.
+      [Journal]
+      ForwardToSyslog=no
+
   # imjournal needs /run/rsyslog to exist before rsyslog starts. Noble starts
   # rsyslog as root and drops to syslog internally, so systemd's RuntimeDirectory
   # would remain root-owned. A tmpfiles rule gives the eventual daemon account
@@ -351,6 +361,10 @@ write_files:
         Ratelimit.Burst="25000"
       )
 
+      # Docker tags container lines docker/<container>. Without this rsyslog cuts the program
+      # name at the slash and every container arrives in Graylog as "docker"; Graylog's
+      # "KASA normalize" pipeline splits the full name into application_name and container_name.
+      global(parser.permitSlashInProgramName="on")
       action(
         type="omfwd"
         target="@@SYSLOG_SERVER@@"

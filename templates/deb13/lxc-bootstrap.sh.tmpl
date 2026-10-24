@@ -800,6 +800,14 @@ RateLimitIntervalSec=30s
 RateLimitBurst=5000
 EOF
 
+install_file /etc/systemd/journald.conf.d/syslog.conf 0644 <<'EOF'
+# Masks the packaged /usr/lib/systemd/journald.conf.d/syslog.conf: Debian 13's rsyslog
+# ships ForwardToSyslog=yes there, and it sorts after 60-remote-syslog.conf and wins.
+# Nothing reads journald's syslog socket; rsyslog reads the journal through imjournal.
+[Journal]
+ForwardToSyslog=no
+EOF
+
 # imjournal needs /run/rsyslog before rsyslog starts, and rsyslog is
 # socket-activated, so start ordering cannot be assumed. Preserve keeps the
 # journal cursor across a restart; without it rsyslog re-forwards the whole
@@ -825,6 +833,10 @@ module(
   Ratelimit.Burst="25000"
 )
 
+# Docker tags container lines docker/<container>. Without this rsyslog cuts the program
+# name at the slash and every container arrives in Graylog as "docker"; Graylog's
+# "KASA normalize" pipeline splits the full name into application_name and container_name.
+global(parser.permitSlashInProgramName="on")
 action(
   type="omfwd"
   target="@@SYSLOG_SERVER@@"

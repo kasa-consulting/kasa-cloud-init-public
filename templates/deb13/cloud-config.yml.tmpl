@@ -286,6 +286,16 @@ write_files:
       RateLimitIntervalSec=30s
       RateLimitBurst=5000
 
+  - path: /etc/systemd/journald.conf.d/syslog.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      # Masks the packaged /usr/lib/systemd/journald.conf.d/syslog.conf: Debian 13's rsyslog
+      # ships ForwardToSyslog=yes there, and it sorts after 60-remote-syslog.conf and wins.
+      # Nothing reads journald's syslog socket; rsyslog reads the journal through imjournal.
+      [Journal]
+      ForwardToSyslog=no
+
   # imjournal needs /run/rsyslog to exist before rsyslog starts, and rsyslog is
   # socket-activated through syslog.socket, so start ordering cannot be assumed.
   # RuntimeDirectory creates it immediately before every start regardless of the
@@ -330,6 +340,10 @@ write_files:
         Ratelimit.Burst="25000"
       )
 
+      # Docker tags container lines docker/<container>. Without this rsyslog cuts the program
+      # name at the slash and every container arrives in Graylog as "docker"; Graylog's
+      # "KASA normalize" pipeline splits the full name into application_name and container_name.
+      global(parser.permitSlashInProgramName="on")
       action(
         type="omfwd"
         target="@@SYSLOG_SERVER@@"

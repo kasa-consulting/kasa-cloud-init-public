@@ -98,8 +98,14 @@ APPDATA_PATHS = (
     "/etc/systemd/system/appdata-verify.service",
 )
 
+# Debian 13's rsyslog package ships /usr/lib/systemd/journald.conf.d/syslog.conf with
+# ForwardToSyslog=yes. It sorts after 60-remote-syslog.conf and wins, so a remote profile
+# masks it with a file of the same name in /etc.
+JOURNALD_SYSLOG_MASK = "/etc/systemd/journald.conf.d/syslog.conf"
+
 REMOTE_SYSLOG_PATHS = (
     "/etc/systemd/journald.conf.d/60-remote-syslog.conf",
+    JOURNALD_SYSLOG_MASK,
     "/etc/rsyslog.d/01-remote.conf",
     "/etc/fail2ban/fail2ban.local",
 )
@@ -123,6 +129,7 @@ VAR_LOG_TMPFS_COMMANDS = (
 )
 
 REQUIRED_RSYSLOG_FRAGMENTS = (
+    'global(parser.permitSlashInProgramName="on")',
     'load="imjournal"',
     'StateFile="/run/rsyslog/imjournal.state"',
     'Ratelimit.Interval="60"',
@@ -907,6 +914,9 @@ def validate_remote_syslog(
         report(name, "journald Storage must be volatile")
     if "ForwardToSyslog=no" not in journald:
         report(name, "journald must not forward to syslog; rsyslog reads the journal")
+    mask = files.get(JOURNALD_SYSLOG_MASK, {}).get("content", "")
+    if not re.search(r"(?m)^ForwardToSyslog=no$", mask):
+        report(name, f"{JOURNALD_SYSLOG_MASK} must mask the packaged ForwardToSyslog=yes")
 
     if load_release(release).os == "ubuntu":
         tmpfiles = files.get("/etc/tmpfiles.d/60-kasa-rsyslog.conf", {}).get(
@@ -1691,11 +1701,14 @@ def validate_lxc_logging(profile: Profile, bootstrap: str) -> None:
         bootstrap, "/etc/systemd/journald.conf.d/60-remote-syslog.conf"
     )
     fail2ban_local = lxc_written_file(bootstrap, "/etc/fail2ban/fail2ban.local")
+    mask = lxc_written_file(bootstrap, JOURNALD_SYSLOG_MASK)
     body = strip_comments(bootstrap)
 
     if not profile.remote_syslog:
         if remote:
             report(name, "a local-logging LXC profile must not forward to a collector")
+        if mask:
+            report(name, "a local-logging LXC profile must keep journald's syslog forwarding")
         if journald:
             report(name, "a local-logging LXC profile must keep the journal durable")
         if fail2ban_local:
@@ -1741,6 +1754,8 @@ def validate_lxc_logging(profile: Profile, bootstrap: str) -> None:
         report(name, "a remote-syslog LXC profile must cap the runtime journal at 64M")
     if "ForwardToSyslog=no" not in journald:
         report(name, "a remote-syslog LXC profile must not forward journal to syslog")
+    if not re.search(r"(?m)^ForwardToSyslog=no$", mask):
+        report(name, f"a remote-syslog LXC profile must write {JOURNALD_SYSLOG_MASK}")
     if not re.search(r"(?mi)^\s*dbfile\s*=\s*/run/", fail2ban_local):
         report(name, "a remote-syslog LXC profile must keep fail2ban state under /run")
     if not re.search(r"(?mi)^\s*logtarget\s*=\s*SYSTEMD-JOURNAL", fail2ban_local):
