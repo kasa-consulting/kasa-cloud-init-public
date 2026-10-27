@@ -71,6 +71,11 @@ case "$IMAGE_CHECKSUM_ALGORITHM" in
   *) fail "Unsupported image checksum algorithm: $IMAGE_CHECKSUM_ALGORITHM" ;;
 esac
 require_command "$image_checksum_command"
+#% if keep_kernel_nic_names
+for command in blkid grep losetup mount mountpoint qemu-img sed udevadm umount; do
+  require_command "$command"
+done
+#% endif
 
 # Serialize direct invocations as well as the rollout coordinator. The coordinator
 # uses a separate lock so these generated scripts can run beneath it.
@@ -101,13 +106,34 @@ fi
 
 
 image_path="${ISO_STORAGE_PATH}/${IMAGE_NAME}"
+import_path="$image_path"
 image_temp=""
 ssh_key_file=""
 vm_created=0
 current_vmid=""
+#% if keep_kernel_nic_names
+work_dir=""
+work_loop=""
+release_work_image() {
+  [ -n "$work_dir" ] || return 0
+  # Called under `||` from cleanup, where errexit is off: stop before rm -rf while
+  # anything is still mounted or attached.
+  if mountpoint -q "$work_dir/root/boot"; then umount "$work_dir/root/boot" || return 1; fi
+  if mountpoint -q "$work_dir/root"; then umount "$work_dir/root" || return 1; fi
+  if [ -n "$work_loop" ]; then
+    losetup --detach "$work_loop" || return 1
+    work_loop=""
+  fi
+  rm -rf -- "$work_dir"
+  work_dir=""
+}
+#% endif
 cleanup() {
   local original_exit_code="$?"
   trap - EXIT
+#% if keep_kernel_nic_names
+  release_work_image || echo "WARNING: could not release the image work copy" >&2
+#% endif
   [ -z "$image_temp" ] || rm -f -- "$image_temp"
   [ -z "$ssh_key_file" ] || rm -f -- "$ssh_key_file"
   if [ "$original_exit_code" -ne 0 ] && \
@@ -162,6 +188,57 @@ if [ "$image_needs_download" -eq 1 ]; then
 fi
 printf '%s  %s\n' "$IMAGE_CHECKSUM" "$image_path" | "$image_checksum_command" --check -
 
+#% if keep_kernel_nic_names
+# Boot with the kernel's NIC name, net.ifnames=0, so the eth0 that Proxmox's network
+# config names is already the NIC's name and cloud-init has nothing to rename. Ubuntu
+# 26.04's dracut initrd takes a DHCP lease on ens18 whenever it runs long enough -- a
+# passed-through GPU makes it -- and cloud-init 26.2 then refuses to take the addressed
+# link down to rename it (`[busy]`, LP#2136392). wait-online fails, cloud-init ends
+# degraded and boot-success is never written: b65-vm on hv1, 2026-10-27, two provisions
+# of two. Done on a local copy, before anything at VMID changes, so a failure here leaves
+# an existing template untouched; the pinned image itself is never modified. The grub.d
+# file carries the setting through every later update-grub; grub.cfg is patched because
+# the first boot reads the one Canonical generated. Measured on hv1 2026-10-27 with the
+# B65 passed through: first boot, a reboot and a regenerated grub.cfg all keep eth0.
+work_dir="$(mktemp -d /var/tmp/kasa-cloud-init-image.XXXXXX)"
+qemu-img convert -f qcow2 -O raw "$image_path" "$work_dir/root.raw"
+work_loop="$(losetup --find --show --partscan "$work_dir/root.raw")"
+udevadm settle
+root_partition="$(blkid -o device -t LABEL=cloudimg-rootfs "${work_loop}p"* || true)"
+boot_partition="$(blkid -o device -t LABEL=BOOT "${work_loop}p"* || true)"
+[ "$(wc -w <<<"$root_partition")" -eq 1 ] || \
+  fail "Expected one cloudimg-rootfs partition in $IMAGE_NAME, found: ${root_partition:-none}"
+[ "$(wc -w <<<"$boot_partition")" -le 1 ] || \
+  fail "Expected at most one BOOT partition in $IMAGE_NAME, found: $boot_partition"
+mkdir "$work_dir/root"
+mount "$root_partition" "$work_dir/root"
+[ -z "$boot_partition" ] || mount "$boot_partition" "$work_dir/root/boot"
+[ -d "$work_dir/root/etc/default/grub.d" ] || \
+  fail "$IMAGE_NAME has no /etc/default/grub.d"
+# GRUB_CMDLINE_LINUX, not _DEFAULT, so the recovery entry names the NIC the same way.
+# The expansion belongs to grub-mkconfig, hence single quotes.
+# shellcheck disable=SC2016
+printf '%s\n' \
+  '# Written by kasa-cloud-init: keep the kernel NIC name (LP#2136392).' \
+  'GRUB_CMDLINE_LINUX="$GRUB_CMDLINE_LINUX net.ifnames=0"' \
+  > "$work_dir/root/etc/default/grub.d/99-kasa-net-ifnames.cfg"
+grub_cfg="$work_dir/root/boot/grub/grub.cfg"
+[ -f "$grub_cfg" ] || fail "$IMAGE_NAME has no /boot/grub/grub.cfg"
+kernel_lines="$(grep -cE '^[[:space:]]*linux[[:space:]]' "$grub_cfg" || true)"
+[ "$kernel_lines" -gt 0 ] || fail "$IMAGE_NAME's grub.cfg boots no kernel"
+! grep -q 'net\.ifnames=' "$grub_cfg" || \
+  fail "$IMAGE_NAME's grub.cfg already sets net.ifnames; review this step against it"
+sed -i -E '/^[[:space:]]*linux[[:space:]]/ s/$/ net.ifnames=0/' "$grub_cfg"
+[ "$(grep -cE '^[[:space:]]*linux[[:space:]].* net\.ifnames=0$' "$grub_cfg")" -eq \
+  "$kernel_lines" ] || fail "Could not add net.ifnames=0 to every kernel in grub.cfg"
+mountpoint -q "$work_dir/root/boot" && umount "$work_dir/root/boot"
+umount "$work_dir/root"
+losetup --detach "$work_loop"
+work_loop=""
+import_path="$work_dir/root.raw"
+echo "Prepared $IMAGE_NAME to boot with net.ifnames=0 ($kernel_lines kernel entries)"
+
+#% endif
 # Resolve what is already at this VMID before changing anything.
 if qm config "$VMID" >/dev/null 2>&1; then
   if [ "$replace" -ne 1 ]; then
@@ -238,7 +315,7 @@ create_template() {
   qm set "$vmid" --rng0 source=/dev/urandom,max_bytes=1024,period=1000
   qm set "$vmid" --ipconfig0 ip=dhcp
 
-  qm importdisk "$vmid" "$image_path" "$VM_STORAGE_NAME"
+  qm importdisk "$vmid" "$import_path" "$VM_STORAGE_NAME"
   root_volume="$(
     qm config "$vmid" |
       awk -F': ' '/^unused[0-9]+: / && !found { print $2; found=1 }'
@@ -288,6 +365,9 @@ create_template() {
 }
 
 create_template "$VMID" "$NAME"
+#% if keep_kernel_nic_names
+release_work_image
+#% endif
 
 echo "Created Proxmox template $VMID ($NAME) successfully"
 echo "Boot it once to complete cloud-init; the VM remains running afterward."

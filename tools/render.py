@@ -187,12 +187,22 @@ class Release:
     codename: str
     vmid_offset: int
     lxc: bool
+    # Boot the VM template with net.ifnames=0, so the kernel's eth0 is the name Proxmox's
+    # network config asks for and cloud-init never renames the NIC. Ubuntu 26.04's dracut
+    # initrd takes a DHCP lease on the predictable name (ens18) before the real root starts
+    # whenever the initrd runs long, as it does with a GPU passed through; cloud-init then
+    # refuses to take an addressed link down to rename it (`[busy]`, LP#2136392, upstream
+    # cloud-init #6887, unfixed in 26.2), wait-online fails and boot-success is never
+    # written. Measured on hv1 2026-10-27 (b65-vm): 2 of 2 provisions failed.
+    keep_kernel_nic_names: bool = False
 
 
 RELEASES = {
     "deb13": Release("deb13", "debian", "13", "trixie", 0, True),
     "ubuntu24": Release("ubuntu24", "ubuntu", "24.04", "noble", 4, False),
-    "ubuntu26": Release("ubuntu26", "ubuntu", "26.04", "resolute", 8, False),
+    "ubuntu26": Release(
+        "ubuntu26", "ubuntu", "26.04", "resolute", 8, False, keep_kernel_nic_names=True
+    ),
 }
 
 

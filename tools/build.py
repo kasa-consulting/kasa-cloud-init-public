@@ -174,7 +174,10 @@ def render_command(
         "@@IMAGE_URL@@": image.url,
     }
     quoted = {marker: shlex.quote(value) for marker, value in replacements.items()}
-    flags = profile_flags(profile)
+    flags = {
+        **profile_flags(profile),
+        "keep_kernel_nic_names": load_release(release).keep_kernel_nic_names,
+    }
     try:
         return expand_template(COMMAND_TEMPLATE, flags, quoted)
     except ValueError as error:
@@ -348,6 +351,23 @@ def validate_generated_command(
         fail("generated Proxmox command must not tell the operator the VM powers off")
     if "the VM remains running afterward" not in command:
         fail("generated Proxmox command must describe first-boot running state")
+
+    # Ubuntu 26.04 clones fail first boot when cloud-init cannot rename the NIC
+    # (render.Release.keep_kernel_nic_names), so the import must be the prepared copy.
+    nic_fragments = (
+        'GRUB_CMDLINE_LINUX="$GRUB_CMDLINE_LINUX net.ifnames=0"',
+        "s/$/ net.ifnames=0/",
+        'import_path="$work_dir/root.raw"',
+        "release_work_image",
+    )
+    if load_release(release).keep_kernel_nic_names:
+        for fragment in nic_fragments:
+            if fragment not in command:
+                fail(f"generated Proxmox command must boot with net.ifnames=0: {fragment}")
+    elif "net.ifnames" in command:
+        fail(f"generated Proxmox command for {release} must not change NIC naming")
+    if 'qm importdisk "$vmid" "$import_path"' not in command:
+        fail("generated Proxmox command must import $import_path")
 
     for fragment in (
         "sha256) image_checksum_command=sha256sum",

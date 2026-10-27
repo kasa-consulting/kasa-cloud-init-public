@@ -6,8 +6,8 @@
 os: ubuntu
 version: "26.04"
 codename: resolute
-build: "20260927"
+build: "20261016"
 name: ubuntu-26.04-server-cloudimg-amd64.img
-url: https://cloud-images.ubuntu.com/releases/resolute/release-20260927/ubuntu-26.04-server-cloudimg-amd64.img
+url: https://cloud-images.ubuntu.com/releases/resolute/release-20261016/ubuntu-26.04-server-cloudimg-amd64.img
 checksum_algorithm: sha256
-checksum: 8800651811af9a85465ad1d552add729947bb16488dddb4a9b5305a3d97332b2
+checksum: 5645d0318ad21f643ebb1ac4567514620e9893380b07b0201fda163baa5b7eb5
