@@ -976,6 +976,9 @@ def validate_remote_syslog(
 
     for entry in document.get("write_files", []):
         body = strip_comments(entry.get("content", ""))
+        # Removing an image's persisted journal keeps logging volatile; only that exact line is
+        # exempt, so any other use of the path still fails.
+        body = re.sub(r"^\s*rm -rf --one-file-system /var/log/journal\s*$", "", body, flags=re.MULTILINE)
         for forbidden in ("/var/spool/", "/var/log/journal"):
             if forbidden in body:
                 report(

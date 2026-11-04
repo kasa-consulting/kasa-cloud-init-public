@@ -1497,6 +1497,11 @@ write_files:
         's/^[[:space:]]*module\(load="imuxsock".*$/# disabled: using imjournal/; s/^[[:space:]]*module\(load="imklog".*$/# disabled: using imjournal/' \
         /etc/rsyslog.conf
       systemctl restart systemd-journald.service
+      # Noble's image ships /var/log/journal, so the build boot's journal persisted there and
+      # Storage=volatile only stops new writes. imjournal keeps its cursor in /run, so after
+      # every reboot it replayed those files, hit its rate limit and dropped the new boot's own
+      # messages (measured 2026-11-03: no post-reboot line reached Graylog). Remove them once.
+      rm -rf --one-file-system /var/log/journal
 #% endif
       /usr/sbin/rsyslogd -N1
       systemctl enable rsyslog.service
